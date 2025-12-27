@@ -14,5 +14,53 @@
       "insert_assign"
     ],
     "score": 0.0
+  },
+  "evo_68afb991": {
+    "steps": [
+      "delete_stmt",
+      "delete_stmt",
+      "insert_if"
+    ],
+    "score": 0.0
+  },
+  "evo_fd20b088": {
+    "steps": [
+      "delete_stmt",
+      "insert_while"
+    ],
+    "score": 0.0
+  },
+  "evo_7c006538": {
+    "steps": [
+      "delete_stmt",
+      "insert_if",
+      "delete_stmt",
+      "insert_assign"
+    ],
+    "score": 0.0
+  },
+  "evo_a04eadf5": {
+    "steps": [
+      "delete_stmt",
+      "insert_if",
+      "insert_while"
+    ],
+    "score": 0.0
+  },
+  "synth_ba229992": {
+    "steps": [
+      "delete_stmt",
+      "modify_line"
+    ],
+    "score": 0.0
+  },
+  "synth_e08f4472": {
+    "steps": [
+      "insert_while",
+      "insert_while",
+      "insert_assign",
+      "insert_assign"
+    ],
+    "score": 0.0
   }
 }
