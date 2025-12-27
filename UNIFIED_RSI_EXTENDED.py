@@ -1,8 +1,8 @@
 """UNIFIED_RSI_EXTENDED.py
 
-True RSI (Recursive Self-Improvement) Engine - Extended Version
-================================================================
-
+True RSI (Recursive Self-Improvement) Engine - BETA
+====================================================
+⚠️ BETA TESTING - Features under active development
 RSI Levels:
 - L0: Hyperparameter tuning
 - L1: Operator weight adaptation  
