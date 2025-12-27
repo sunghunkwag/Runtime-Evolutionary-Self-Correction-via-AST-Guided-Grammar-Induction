@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# RSI Runtime State
+.rsi_state/
+state.json
+operators_lib.json
+map_elites.json
+*.json
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/
