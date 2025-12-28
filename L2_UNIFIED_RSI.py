@@ -63,6 +63,19 @@ GRAMMAR_PROBS.update({'binop': 2.0, 'call': 1.0, 'const': 1.0, 'var': 2.0})
 SAFE_BUILTINS = {'abs': abs, 'min': min, 'max': max, 'float': float, 'int': int, 'len': len, 'range': range, 'list': list, 'sorted': sorted, 'reversed': reversed, 'sum': sum} # [NEW] Algorithmic Builtins
 SAFE_VARS = {'x'}
 
+# [NEW] Phase 4: ARC-Lite DSL (Grid Primitives)
+def _g_rot90(g): return [list(r) for r in zip(*g[::-1])]
+def _g_flip(g): return g[::-1]
+def _g_inv(g): return [[1-c if c in (0,1) else c for c in r] for r in g]
+def _g_get(g, r, c): return g[r%len(g)][c%len(g[0])] if g and g[0] else 0
+
+SAFE_FUNCS.update({
+    'rot90': _g_rot90, 'flip': _g_flip, 'inv': _g_inv, 'get': _g_get
+})
+# Init Grammar weights for new ops
+for k in ['rot90', 'flip', 'inv', 'get']:
+    GRAMMAR_PROBS[k] = 1.0
+
 class StepLimitExceeded(Exception): pass
 
 class StepLimitTransformer(ast.NodeTransformer):
@@ -252,6 +265,10 @@ TARGET_FNS = {
     'reverse': lambda x: list(reversed(x)),
     'max': lambda x: max(x) if x else 0,
     'filter': lambda x: [v for v in x if v > 0], # Simple filter: positive only
+    # [NEW] Phase 4: ARC Tasks
+    'arc_ident': lambda x: x,
+    'arc_rot90': lambda x: [list(r) for r in zip(*x[::-1])],
+    'arc_inv': lambda x: [[1-c if c in (0,1) else c for c in r] for r in x],
     'poly2': lambda x: 0.7 * x * x - 0.2 * x + 0.3, 
     'poly3': lambda x: 0.3 * x ** 3 - 0.5 * x + 0.1, 
     'sinmix': lambda x: math.sin(x) + 0.3 * math.cos(2 * x), 
@@ -292,6 +309,26 @@ def sample_batch(rng: random.Random, t: TaskSpec) -> Batch:
         x_st = gen_lists(t.n_hold, t.x_max + 5, t.x_max + 10) # Stress much longer
         
         # Ground Truth
+        y_tr = [f(x) for x in x_tr]
+        y_ho = [f(x) for x in x_ho]
+        y_st = [f(x) for x in x_st]
+        return Batch(x_tr, y_tr, x_ho, y_ho, x_st, y_st)
+
+    elif t.name.startswith('arc_'):
+        # [NEW] Grid Generation for ARC
+        def gen_grids(k, dim):
+            data = []
+            for _ in range(k):
+                # 3x3 to 5x5 binary grids
+                g = [[rng.randint(0, 1) for _ in range(dim)] for _ in range(dim)]
+                data.append(g)
+            return data
+            
+        dim = int(t.x_min) if t.x_min > 0 else 3
+        x_tr = gen_grids(20, dim)
+        x_ho = gen_grids(10, dim)
+        x_st = gen_grids(10, dim+1)
+        
         y_tr = [f(x) for x in x_tr]
         y_ho = [f(x) for x in x_ho]
         y_st = [f(x) for x in x_st]
@@ -401,6 +438,19 @@ def calc_heuristic_loss(p: Any, t: Any, task_name: str) -> float:
             # Use standard list error
             return sum(calc_error(pv, tv) for pv, tv in zip(p, t))
             
+    # [NEW] Phase 4: ARC Grid Loss
+    if task_name.startswith('arc_'):
+        if not isinstance(p, list) or not p or not isinstance(p[0], list): return 1000.0
+        # Shape penalty
+        if len(p) != len(t) or len(p[0]) != len(t[0]): 
+            return 500.0 + abs(len(p)-len(t)) + abs(len(p[0])-len(t[0]))
+        # Pixel mismatch count
+        err = 0
+        for r in range(len(t)):
+            for c in range(len(t[0])):
+                if p[r][c] != t[r][c]: err += 1
+        return float(err)
+
     # Default to generic recursive error
     return calc_error(p, t)
 
@@ -414,7 +464,7 @@ def mse_exec(code: str, xs: List[Any], ys: List[Any], task_name: str='') -> Tupl
             pred = safe_exec(code, x)
             if pred is None: return (False, float('inf'), "No return")
             
-            if task_name in ('sort', 'reverse', 'max', 'filter'):
+            if task_name in ('sort', 'reverse', 'max', 'filter') or task_name.startswith('arc_'):
                 total_err += calc_heuristic_loss(pred, y, task_name)
             else:
                 total_err += calc_error(pred, y)
