@@ -838,24 +838,27 @@ class ProblemGenerator:
         """Phase 3: Curriculum Learning (Parameter Evolution)."""
         # Guaranteed Solvability: Simply increase difficulty of known solvable tasks
         
-        # 1. Select Base Task Type
-        base_name = 'sort' # Pivot to Sort for now
         
-        # 2. Determine Current Difficulty Level (Mock logic for beta)
-        # In real logic, we'd check the 'task' object passed in, but here we generate new
-        level = rng.randint(1, 5)
+        # 1. Curriculum Selection
+        options = ['sort', 'reverse', 'max', 'filter', 'arc_ident', 'arc_inv', 'arc_rot90']
+        base_name = rng.choice(options)
         
-        mn = 3 + level * 2
-        mx = 5 + level * 3
+        # 2. Difficulty Parameters
+        level = rng.randint(1, 3)
+        mn = 3 + level
+        mx = 5 + level
         
+        # For ARC, x_min is dimension (3 to 6)
+        if base_name.startswith('arc_'):
+             mn, mx = 3, 5 # 3x3 to 5x5
+             
         new_task = TaskSpec(
             name=base_name,
-            n_train=64 + level * 10,
+            n_train=64,
             n_hold=32,
-            # Hijack 'x_min'/'x_max' to store List Length Range for 'sort'
-            x_min=float(mn), # Min Length
-            x_max=float(mx), # Max Length
-            noise=0.0 # No noise for logic tasks
+            x_min=float(mn), # Min Length/Dim
+            x_max=float(mx), # Max Length/Dim
+            noise=0.0
         )
         return new_task
                 
