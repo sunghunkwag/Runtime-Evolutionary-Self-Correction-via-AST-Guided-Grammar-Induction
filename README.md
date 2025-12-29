@@ -27,6 +27,12 @@ Run the integrated test suite coverage (EDA, Algorithmic, ARC, TDR, Autopatch):
 python test_suite.py
 ```
 
+For full integration verification, run:
+
+```bash
+python verify_full_integration.py
+```
+
 ## Performance Metrics
 
 - **Grammar Adaptation**: Confirmed significant weight shifts (e.g., Var 2.0 -> 21.0) during evolution.

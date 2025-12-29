@@ -76,6 +76,27 @@ def unified_diff(old: str, new: str, name: str) -> str:
         )
     )
 
+def apply_patch_safe(path: str, new_code: str) -> bool:
+    target = Path(path)
+    backup = target.with_name(target.name + ".bak")
+    original = None
+    if target.exists():
+        original = target.read_text(encoding="utf-8")
+        backup.write_text(original, encoding="utf-8")
+    try:
+        ast.parse(new_code)
+    except SyntaxError:
+        return False
+    try:
+        target.write_text(new_code, encoding="utf-8")
+    except Exception:
+        if original is not None:
+            target.write_text(original, encoding="utf-8")
+        elif target.exists():
+            target.unlink()
+        return False
+    return True
+
 
 # ---------------------------
 # Safe primitives
