@@ -1,8 +1,8 @@
-""" 
-UNIFIED_RSI_EXTENDED_FIXED.py
+"""
+UNIFIED_RSI_EXTENDED.py
 
-True RSI (Recursive Self-Improvement) Engine - BETA (Fixed/Executable)
-======================================================================
+True RSI (Recursive Self-Improvement) Engine - BETA (Executable)
+================================================================
 
 RSI Levels:
 - L0: Hyperparameter tuning
@@ -13,17 +13,18 @@ RSI Levels:
 - L5: Modify self-modification logic (simple source edits)
 
 CLI:
-  python UNIFIED_RSI_EXTENDED_FIXED.py selftest
-  python UNIFIED_RSI_EXTENDED_FIXED.py evolve --fresh --generations 100
-  python UNIFIED_RSI_EXTENDED_FIXED.py autopatch --levels 0,1,3 --apply
-  python UNIFIED_RSI_EXTENDED_FIXED.py rsi-loop --generations 50 --rounds 10
+  python UNIFIED_RSI_EXTENDED.py selftest
+  python UNIFIED_RSI_EXTENDED.py evolve --fresh --generations 100
+  python UNIFIED_RSI_EXTENDED.py learner-evolve --fresh --generations 100
+  python UNIFIED_RSI_EXTENDED.py autopatch --levels 0,1,3 --apply
+  python UNIFIED_RSI_EXTENDED.py rsi-loop --generations 50 --rounds 10
+  python UNIFIED_RSI_EXTENDED.py rsi-loop --generations 20 --rounds 5 --mode learner
 """
 from __future__ import annotations
 
 import argparse
 import ast
 import collections
-import dataclasses
 import difflib
 import hashlib
 import json
@@ -124,7 +125,7 @@ SAFE_BUILTINS = {
     "sum": sum,
 }
 
-SAFE_VARS = {"x", "v0", "v1", "v2", "v3"}
+SAFE_VARS = {"x"} | {f"v{i}" for i in range(10)}
 
 
 # grid helpers (ARC-like)
@@ -158,13 +159,18 @@ class StepLimitTransformer(ast.NodeTransformer):
     def __init__(self, limit: int = 5000):
         self.limit = limit
 
-    def visit_FunctionDef(self, node):
+    def _inject_steps(self, node: ast.FunctionDef) -> None:
         glob = ast.Global(names=["_steps"])
+        reset = ast.parse("_steps = 0").body[0]
         inc = ast.parse("_steps += 1").body[0]
         check = ast.parse(f"if _steps > {self.limit}: raise StepLimitExceeded()").body[0]
         node.body.insert(0, glob)
-        node.body.insert(1, inc)
-        node.body.insert(2, check)
+        node.body.insert(1, reset)
+        node.body.insert(2, inc)
+        node.body.insert(3, check)
+
+    def visit_FunctionDef(self, node):
+        self._inject_steps(node)
         self.generic_visit(node)
         return node
 
@@ -198,6 +204,7 @@ class CodeValidator(ast.NodeVisitor):
         ast.arg,
         ast.Return,
         ast.Assign,
+        ast.AnnAssign,
         ast.AugAssign,
         ast.Name,
         ast.Constant,
@@ -213,7 +220,9 @@ class CodeValidator(ast.NodeVisitor):
         ast.Call,
         ast.List,
         ast.Tuple,  # critical for tuple-assign (swap)
+        ast.Dict,
         ast.Subscript,
+        ast.Slice,
         ast.Load,
         ast.Store,
         ast.IfExp,
@@ -235,13 +244,17 @@ class CodeValidator(ast.NodeVisitor):
             self.ok, self.err = (False, f"Forbidden: {type(node).__name__}")
             return
         if isinstance(node, ast.Name):
-            if node.id.startswith("__") or node.id in ("open", "eval", "exec", "compile", "__import__"):
+            if node.id.startswith("__") or node.id in ("open", "eval", "exec", "compile", "__import__", "globals", "locals"):
                 self.ok, self.err = (False, f"Forbidden name: {node.id}")
                 return
         if isinstance(node, ast.Call):
             # forbid attribute calls (e.g., os.system)
             if not isinstance(node.func, ast.Name):
                 self.ok, self.err = (False, "Forbidden call form (non-Name callee)")
+                return
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and node.value.id in SAFE_BUILTINS:
+                self.ok, self.err = (False, "Forbidden subscript on builtin")
                 return
         super().generic_visit(node)
 
@@ -263,6 +276,8 @@ class ExprValidator(ast.NodeVisitor):
         ast.Call,
         ast.Name, ast.Load,
         ast.Constant,
+        ast.List, ast.Tuple, ast.Dict,
+        ast.Subscript, ast.Slice,
         ast.operator, ast.unaryop, ast.boolop, ast.cmpop,
     )
 
@@ -276,7 +291,7 @@ class ExprValidator(ast.NodeVisitor):
             self.ok, self.err = (False, f"Forbidden expr node: {type(node).__name__}")
             return
         if isinstance(node, ast.Name):
-            if node.id.startswith("__") or node.id in ("open", "eval", "exec", "compile", "__import__"):
+            if node.id.startswith("__") or node.id in ("open", "eval", "exec", "compile", "__import__", "globals", "locals"):
                 self.ok, self.err = (False, f"Forbidden name: {node.id}")
                 return
             if node.id not in self.allowed_names:
@@ -286,17 +301,17 @@ class ExprValidator(ast.NodeVisitor):
             if not isinstance(node.func, ast.Name):
                 self.ok, self.err = (False, "Forbidden call form (non-Name callee)")
                 return
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and node.value.id in SAFE_BUILTINS:
+                self.ok, self.err = (False, "Forbidden subscript on builtin")
+                return
         super().generic_visit(node)
 
 def validate_expr(expr: str, extra: Optional[Set[str]] = None) -> Tuple[bool, str]:
+    """PHASE A: validate expression with safe names only."""
     try:
         extra = extra or set()
-        allowed = (
-            set(SAFE_FUNCS.keys())
-            | set(SAFE_BUILTINS.keys())
-            | set(SAFE_VARS)
-            | set(extra)
-        )
+        allowed = set(SAFE_FUNCS.keys()) | set(SAFE_BUILTINS.keys()) | set(SAFE_VARS) | set(extra)
         tree = ast.parse(expr, mode="eval")
         v = ExprValidator(allowed)
         v.visit(tree)
@@ -304,21 +319,20 @@ def validate_expr(expr: str, extra: Optional[Set[str]] = None) -> Tuple[bool, st
     except Exception as e:
         return (False, str(e))
 
-def safe_eval(expr: str, x: Any, extra_env: Optional[Dict[str, Any]] = None, extra_names: Optional[Set[str]] = None) -> Any:
-    ok, _ = validate_expr(expr, extra=extra_names)
+def safe_eval(expr: str, x: Any, extra_funcs: Optional[Dict[str, Callable]] = None) -> Any:
+    """PHASE A: safe evaluation of expressions with optional helper functions."""
+    ok, _ = validate_expr(expr, extra=set(extra_funcs or {}))
     if not ok:
         return float("nan")
     try:
         env: Dict[str, Any] = {}
         env.update(SAFE_FUNCS)
         env.update(SAFE_BUILTINS)
+        if extra_funcs:
+            env.update(extra_funcs)
         env["x"] = x
-        env["v0"] = x
-        env["v1"] = x
-        env["v2"] = x
-        env["v3"] = x
-        if extra_env:
-            env.update(extra_env)
+        for i in range(10):
+            env[f"v{i}"] = x
         return eval(compile(ast.parse(expr, mode="eval"), "<expr>", "eval"), {"__builtins__": {}}, env)
     except Exception:
         return float("nan")
@@ -382,6 +396,25 @@ def safe_exec_engine(code: str, context: Dict[str, Any], timeout_steps: int = 50
         if "run" in env:
             return env["run"]()
         return None
+    except Exception:
+        return None
+
+
+def safe_load_module(code: str, timeout_steps: int = 5000) -> Optional[Dict[str, Any]]:
+    """PHASE B: safely load a learner module with a restricted environment."""
+    ok, err = validate_code(code)
+    if not ok:
+        return None
+    try:
+        tree = ast.parse(code)
+        transformer = StepLimitTransformer(timeout_steps)
+        tree = transformer.visit(tree)
+        ast.fix_missing_locations(tree)
+        env: Dict[str, Any] = {"_steps": 0, "StepLimitExceeded": StepLimitExceeded}
+        env.update(SAFE_FUNCS)
+        env.update(SAFE_BUILTINS)
+        exec(compile(tree, "<learner>", "exec"), {"__builtins__": {}}, env)
+        return env
     except Exception:
         return None
 
@@ -590,13 +623,64 @@ class Genome:
     @property
     def code(self) -> str:
         body = "\n    ".join(self.statements) if self.statements else "return x"
-        return f"def run(x):\n    # {self.gid}\n    _steps=0\n    v0=x\n    {body}"
+        return f"def run(x):\n    # {self.gid}\n    v0=x\n    {body}"
 
     def __post_init__(self):
         if not self.gid:
             self.gid = sha256("".join(self.statements) + str(time.time()))[:12]
         if not self.birth_ms:
             self.birth_ms = now_ms()
+
+
+@dataclass
+class LearnerGenome:
+    """PHASE B: learner genome with encode/predict/update/objective blocks."""
+    encode_stmts: List[str]
+    predict_stmts: List[str]
+    update_stmts: List[str]
+    objective_stmts: List[str]
+    gid: str = ""
+    parents: List[str] = field(default_factory=list)
+    op_tag: str = "init"
+    birth_ms: int = 0
+
+    @property
+    def code(self) -> str:
+        def ensure_return(stmts: List[str], fallback: str) -> List[str]:
+            for s in stmts:
+                if s.strip().startswith("return "):
+                    return stmts
+            return stmts + [fallback]
+
+        enc = ensure_return(self.encode_stmts or [], "return x")
+        pred = ensure_return(self.predict_stmts or [], "return z")
+        upd = ensure_return(self.update_stmts or [], "return mem")
+        obj = ensure_return(self.objective_stmts or [], "return hold + 0.5*stress + 0.01*nodes")
+
+        enc_body = "\n    ".join(enc) if enc else "return x"
+        pred_body = "\n    ".join(pred) if pred else "return z"
+        upd_body = "\n    ".join(upd) if upd else "return mem"
+        obj_body = "\n    ".join(obj) if obj else "return hold + 0.5*stress + 0.01*nodes"
+
+        return (
+            "def init_mem():\n"
+            "    return {\"w\": 0.0, \"b\": 0.0, \"t\": 0}\n\n"
+            "def encode(x, mem):\n"
+            f"    # {self.gid}\n    {enc_body}\n\n"
+            "def predict(z, mem):\n"
+            f"    {pred_body}\n\n"
+            "def update(mem, x, y_pred, y_true, lr=0.05):\n"
+            f"    {upd_body}\n\n"
+            "def objective(train, hold, stress, nodes):\n"
+            f"    {obj_body}\n"
+        )
+
+    def __post_init__(self):
+        if not self.gid:
+            self.gid = sha256("".join(self.encode_stmts + self.predict_stmts + self.update_stmts + self.objective_stmts) + str(time.time()))[:12]
+        if not self.birth_ms:
+            self.birth_ms = now_ms()
+
 
 @dataclass
 class EvalResult:
@@ -628,6 +712,36 @@ def calc_error(p: Any, t: Any) -> float:
     return 1_000_000.0
 
 
+def _list_invariance_penalty(x: Any, p: Any, task_name: str) -> float:
+    if not isinstance(x, list):
+        return 0.0
+    if task_name in ("sort", "reverse"):
+        if not isinstance(p, list):
+            return 5_000.0
+        if len(p) != len(x):
+            return 2_000.0 + 10.0 * abs(len(p) - len(x))
+        try:
+            if collections.Counter(p) != collections.Counter(x):
+                return 2_000.0
+        except TypeError:
+            pass
+    if task_name == "filter":
+        if not isinstance(p, list):
+            return 5_000.0
+        try:
+            x_counts = collections.Counter(x)
+            p_counts = collections.Counter(p)
+            for k, v in p_counts.items():
+                if x_counts.get(k, 0) < v:
+                    return 2_000.0
+        except TypeError:
+            pass
+    if task_name == "max":
+        if not isinstance(p, (int, float)):
+            return 5_000.0
+    return 0.0
+
+
 def calc_loss_sort(p: List[Any], t: List[Any]) -> float:
     if not isinstance(p, list):
         return 1_000_000.0
@@ -646,28 +760,29 @@ def calc_loss_sort(p: List[Any], t: List[Any]) -> float:
     return float(inversions)
 
 
-def calc_heuristic_loss(p: Any, t: Any, task_name: str) -> float:
+def calc_heuristic_loss(p: Any, t: Any, task_name: str, x: Any = None) -> float:
+    penalty = _list_invariance_penalty(x, p, task_name)
     if task_name == "sort":
-        return calc_loss_sort(p, t)
+        return calc_loss_sort(p, t) + penalty
     if isinstance(t, list):
         if not isinstance(p, list):
-            return 1_000_000.0
+            return 1_000_000.0 + penalty
         if len(p) != len(t):
-            return 500.0 * abs(len(p) - len(t))
+            return 500.0 * abs(len(p) - len(t)) + penalty
         if task_name in ("reverse", "filter"):
-            return sum(calc_error(pv, tv) for pv, tv in zip(p, t))
+            return sum(calc_error(pv, tv) for pv, tv in zip(p, t)) + penalty
     if task_name.startswith("arc_"):
         if not isinstance(p, list) or not p or not isinstance(p[0], list):
-            return 1000.0
+            return 1000.0 + penalty
         if len(p) != len(t) or len(p[0]) != len(t[0]):
-            return 500.0 + abs(len(p) - len(t)) + abs(len(p[0]) - len(t[0]))
+            return 500.0 + abs(len(p) - len(t)) + abs(len(p[0]) - len(t[0])) + penalty
         err = 0
         for r in range(len(t)):
             for c in range(len(t[0])):
                 if p[r][c] != t[r][c]:
                     err += 1
-        return float(err)
-    return calc_error(p, t)
+        return float(err) + penalty
+    return calc_error(p, t) + penalty
 
 
 def mse_exec(code: str, xs: List[Any], ys: List[Any], task_name: str = "", extra_env: Optional[Dict[str, Any]] = None) -> Tuple[bool, float, str]:
@@ -681,7 +796,7 @@ def mse_exec(code: str, xs: List[Any], ys: List[Any], task_name: str = "", extra
             if pred is None:
                 return (False, float("inf"), "No return")
             if task_name in ("sort", "reverse", "max", "filter") or task_name.startswith("arc_"):
-                total_err += calc_heuristic_loss(pred, y, task_name)
+                total_err += calc_heuristic_loss(pred, y, task_name, x=x)
             else:
                 total_err += calc_error(pred, y)
         return (True, total_err / max(1, len(xs)), "")
@@ -699,6 +814,67 @@ def evaluate(g: Genome, b: Batch, task_name: str, lam: float = 0.0001, extra_env
     score = SCORE_W_HOLD * ho + SCORE_W_STRESS * st + SCORE_W_TRAIN * tr + lam * nodes
     err = e1 or e2 or e3
     return EvalResult(ok, tr, ho, st, nodes, score, err or None)
+
+
+def evaluate_learner(
+    learner: LearnerGenome,
+    b: Batch,
+    task_name: str,
+    adapt_steps: int = 8,
+    lam: float = 0.0001,
+) -> EvalResult:
+    """PHASE B: evaluate learner with adaptation on training only."""
+    env = safe_load_module(learner.code)
+    if not env:
+        return EvalResult(False, float("inf"), float("inf"), float("inf"), 0, float("inf"), "load_failed")
+    required = ["init_mem", "encode", "predict", "update", "objective"]
+    if not all(name in env and callable(env[name]) for name in required):
+        return EvalResult(False, float("inf"), float("inf"), float("inf"), 0, float("inf"), "missing_funcs")
+
+    init_mem = env["init_mem"]
+    encode = env["encode"]
+    predict = env["predict"]
+    update = env["update"]
+    objective = env["objective"]
+
+    try:
+        mem = init_mem()
+    except Exception:
+        mem = {"w": 0.0, "b": 0.0, "t": 0}
+
+    def run_eval(xs: List[Any], ys: List[Any], do_update: bool) -> float:
+        nonlocal mem
+        total = 0.0
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            try:
+                z = encode(x, mem)
+                y_pred = predict(z, mem)
+            except Exception:
+                y_pred = None
+            if task_name in ("sort", "reverse", "max", "filter") or task_name.startswith("arc_"):
+                total += calc_heuristic_loss(y_pred, y, task_name, x=x)
+            else:
+                total += calc_error(y_pred, y)
+            if do_update and i < adapt_steps:
+                try:
+                    mem = update(mem, x, y_pred, y, 0.05)
+                except Exception:
+                    pass
+        return total / max(1, len(xs))
+
+    try:
+        train = run_eval(b.x_tr, b.y_tr, do_update=True)
+        hold = run_eval(b.x_ho, b.y_ho, do_update=False)
+        stress = run_eval(b.x_st, b.y_st, do_update=False)
+        nodes = node_count(learner.code)
+        obj = objective(train, hold, stress, nodes)
+        if not isinstance(obj, (int, float)) or not math.isfinite(obj):
+            obj = SCORE_W_HOLD * hold + SCORE_W_STRESS * stress + SCORE_W_TRAIN * train
+        score = float(obj) + lam * nodes
+        ok = all(math.isfinite(v) for v in (train, hold, stress, score))
+        return EvalResult(ok, train, hold, stress, nodes, score, None if ok else "nan")
+    except Exception as exc:
+        return EvalResult(False, float("inf"), float("inf"), float("inf"), 0, float("inf"), str(exc))
 
 
 # ---------------------------
@@ -845,12 +1021,37 @@ def op_list_manipulation(rng: random.Random, stmts: List[str]) -> List[str]:
 
 def op_modify_return(rng: random.Random, stmts: List[str]) -> List[str]:
     new_stmts = stmts[:]
-    active_vars = ["x", "v0", "v1", "v2", "v3"]
+    active_vars = ["x"] + [f"v{i}" for i in range(4)]
     for i in range(len(new_stmts) - 1, -1, -1):
         if new_stmts[i].strip().startswith("return "):
             new_stmts[i] = f"return {rng.choice(active_vars)}"
             return new_stmts
     new_stmts.append(f"return {rng.choice(active_vars)}")
+    return new_stmts
+
+
+def op_learner_update_step(rng: random.Random, stmts: List[str]) -> List[str]:
+    new_stmts = stmts[:]
+    idx = rng.randint(0, len(new_stmts))
+    ops = [
+        "mem['w'] = mem['w'] + lr * (y_true - y_pred) * x",
+        "mem['b'] = mem['b'] + lr * (y_true - y_pred)",
+        "mem['t'] = mem['t'] + 1",
+        "return mem",
+    ]
+    new_stmts.insert(idx, rng.choice(ops))
+    return new_stmts
+
+
+def op_learner_objective_tweak(rng: random.Random, stmts: List[str]) -> List[str]:
+    new_stmts = stmts[:]
+    idx = rng.randint(0, len(new_stmts))
+    expr = rng.choice([
+        "return hold + 0.5*stress + 0.01*nodes",
+        "return 0.6*hold + 0.3*stress + 0.1*train",
+        "return hold + stress + 0.001*nodes",
+    ])
+    new_stmts.insert(idx, expr)
     return new_stmts
 
 
@@ -864,6 +1065,8 @@ OPERATORS: Dict[str, Callable[[random.Random, List[str]], List[str]]] = {
     "change_binary": op_change_binary,
     "list_manip": op_list_manipulation,
     "modify_return": op_modify_return,
+    "learner_update": op_learner_update_step,
+    "learner_objective": op_learner_objective_tweak,
 }
 PRIMITIVE_OPS = list(OPERATORS.keys())
 
@@ -884,6 +1087,30 @@ def synthesize_new_operator(rng: random.Random) -> Tuple[str, Dict]:
     steps = [rng.choice(PRIMITIVE_OPS) for _ in range(n_steps)]
     name = f"synth_{sha256(''.join(steps) + str(time.time()))[:8]}"
     return (name, {"steps": steps, "score": 0.0})
+
+
+def mutate_learner(rng: random.Random, learner: LearnerGenome, meta: "MetaState") -> LearnerGenome:
+    """PHASE B: mutate a learner genome by selecting a block."""
+    blocks = ["encode", "predict", "update", "objective"]
+    block = rng.choice(blocks)
+    op = meta.sample_op(rng)
+
+    def apply_block(stmts: List[str]) -> List[str]:
+        if op in OPERATORS:
+            return OPERATORS[op](rng, stmts)
+        return stmts
+
+    if block == "encode":
+        new_encode = apply_block(learner.encode_stmts)
+        return LearnerGenome(new_encode, learner.predict_stmts, learner.update_stmts, learner.objective_stmts, parents=[learner.gid], op_tag=f"mut:{block}:{op}")
+    if block == "predict":
+        new_predict = apply_block(learner.predict_stmts)
+        return LearnerGenome(learner.encode_stmts, new_predict, learner.update_stmts, learner.objective_stmts, parents=[learner.gid], op_tag=f"mut:{block}:{op}")
+    if block == "update":
+        new_update = apply_block(learner.update_stmts)
+        return LearnerGenome(learner.encode_stmts, learner.predict_stmts, new_update, learner.objective_stmts, parents=[learner.gid], op_tag=f"mut:{block}:{op}")
+    new_objective = apply_block(learner.objective_stmts)
+    return LearnerGenome(learner.encode_stmts, learner.predict_stmts, learner.update_stmts, new_objective, parents=[learner.gid], op_tag=f"mut:{block}:{op}")
 
 
 # ---------------------------
@@ -937,20 +1164,21 @@ SURROGATE = SurrogateModel()
 
 
 class MAPElitesArchive:
-    def __init__(self):
-        self.grid: Dict[Tuple[int, int], Tuple[float, Genome]] = {}
+    def __init__(self, genome_cls: type = Genome):
+        self.grid: Dict[Tuple[int, int], Tuple[float, Any]] = {}
+        self.genome_cls = genome_cls
 
     def _features(self, code: str) -> Tuple[int, int]:
         l_bin = min(20, len(code) // 20)
         d_bin = min(10, code.count("\n") // 2)
         return (l_bin, d_bin)
 
-    def add(self, genome: Genome, score: float):
+    def add(self, genome: Any, score: float):
         feat = self._features(genome.code)
         if feat not in self.grid or score < self.grid[feat][0]:
             self.grid[feat] = (score, genome)
 
-    def sample(self, rng: random.Random) -> Optional[Genome]:
+    def sample(self, rng: random.Random) -> Optional[Any]:
         if not self.grid:
             return None
         return rng.choice(list(self.grid.values()))[1]
@@ -961,24 +1189,27 @@ class MAPElitesArchive:
             "entries": [(list(k), v[0], asdict(v[1])) for k, v in self.grid.items()],
         }
 
-    @staticmethod
-    def from_snapshot(s: Dict) -> "MAPElitesArchive":
-        ma = MAPElitesArchive()
+    def from_snapshot(self, s: Dict) -> "MAPElitesArchive":
+        ma = MAPElitesArchive(self.genome_cls)
         for k, score, g_dict in s.get("entries", []):
-            ma.grid[tuple(k)] = (score, Genome(**g_dict))
+            ma.grid[tuple(k)] = (score, self.genome_cls(**g_dict))
         return ma
 
 
-MAP_ELITES = MAPElitesArchive()
+MAP_ELITES = MAPElitesArchive(Genome)
+MAP_ELITES_LEARNER = MAPElitesArchive(LearnerGenome)
 
-def save_map_elites(path: Path):
-    path.write_text(json.dumps(MAP_ELITES.snapshot(), indent=2), encoding="utf-8")
+def map_elites_filename(mode: str) -> str:
+    return "map_elites_learner.json" if mode == "learner" else "map_elites.json"
 
-def load_map_elites(path: Path):
-    global MAP_ELITES
+def save_map_elites(path: Path, archive: MAPElitesArchive):
+    path.write_text(json.dumps(archive.snapshot(), indent=2), encoding="utf-8")
+
+def load_map_elites(path: Path, archive: MAPElitesArchive):
     if path.exists():
         try:
-            MAP_ELITES = MAPElitesArchive.from_snapshot(json.loads(path.read_text(encoding="utf-8")))
+            loaded = archive.from_snapshot(json.loads(path.read_text(encoding="utf-8")))
+            archive.grid = loaded.grid
         except Exception:
             pass
 
@@ -1116,6 +1347,39 @@ def seed_genome(rng: random.Random, hint: Optional[str] = None) -> Genome:
     return Genome(statements=rng.choice(seeds))
 
 
+def seed_learner_genome(rng: random.Random, hint: Optional[str] = None) -> LearnerGenome:
+    """PHASE B: learner seed set with simple predictors and objectives."""
+    base_encode = ["return x"]
+    base_predict = ["return z"]
+    base_update = ["return mem"]
+    base_obj = ["return hold + 0.5*stress + 0.01*nodes"]
+
+    linear_predict = ["return mem['w'] * z + mem['b']"]
+    linear_update = [
+        "mem['w'] = mem['w'] + lr * (y_true - y_pred) * z",
+        "mem['b'] = mem['b'] + lr * (y_true - y_pred)",
+        "return mem",
+    ]
+
+    list_sort_predict = ["return sorted(z)"]
+    list_reverse_predict = ["return list(reversed(z))"]
+    list_max_predict = ["return max(z) if z else 0"]
+
+    seeds = [
+        LearnerGenome(base_encode, base_predict, base_update, base_obj),
+        LearnerGenome(base_encode, linear_predict, linear_update, base_obj),
+    ]
+
+    if hint == "HINT_SORT":
+        seeds.append(LearnerGenome(base_encode, list_sort_predict, base_update, base_obj))
+    elif hint == "HINT_REVERSE":
+        seeds.append(LearnerGenome(base_encode, list_reverse_predict, base_update, base_obj))
+    elif hint == "HINT_MAX":
+        seeds.append(LearnerGenome(base_encode, list_max_predict, base_update, base_obj))
+
+    return rng.choice(seeds)
+
+
 # ---------------------------
 # Function library (learned helpers)
 # ---------------------------
@@ -1174,10 +1438,13 @@ class FunctionLibrary:
 
     def get_helpers(self) -> Dict[str, Callable]:
         # helper functions callable from evolved programs
-        helpers = {}
+        helpers: Dict[str, Callable] = {}
+
+        def make_helper(expr: str):
+            return lambda x: safe_eval(expr, x, extra_funcs=helpers)
+
         for n, f in self.funcs.items():
-            expr = f.expr
-            helpers[n] = (lambda e: (lambda x: safe_eval(e, x, extra_names=set(self.funcs.keys()))))(expr)
+            helpers[n] = make_helper(f.expr)
         return helpers
 
     def snapshot(self) -> Dict:
@@ -1240,6 +1507,7 @@ class MetaState:
     crossover_rate: float = 0.1971
     complexity_lambda: float = 0.0001
     epsilon_explore: float = 0.4213
+    adapt_steps: int = 8
     stuck_counter: int = 0
     strategy: EngineStrategy = field(default_factory=lambda: EngineStrategy(
         selection_code=DEFAULT_SELECTION_CODE,
@@ -1275,7 +1543,7 @@ class MetaState:
 
 class MetaCognitiveEngine:
     @staticmethod
-    def analyze_execution(results: List[Tuple[Genome, EvalResult]], meta: MetaState):
+    def analyze_execution(results: List[Tuple[Any, EvalResult]], meta: MetaState):
         errors = [r.err.split(":")[0] for _, r in results if (not r.ok and r.err)]
         if not errors:
             return
@@ -1468,6 +1736,158 @@ class Universe:
         return u
 
 
+@dataclass
+class UniverseLearner:
+    """PHASE C: learner multiverse wrapper."""
+    uid: int
+    seed: int
+    meta: MetaState
+    pool: List[LearnerGenome]
+    library: FunctionLibrary
+    discriminator: ProblemGenerator = field(default_factory=ProblemGenerator)
+    best: Optional[LearnerGenome] = None
+    best_score: float = float("inf")
+    best_hold: float = float("inf")
+    best_stress: float = float("inf")
+    history: List[Dict] = field(default_factory=list)
+
+    def step(self, gen: int, task: TaskSpec, pop_size: int) -> Dict:
+        rng = random.Random(self.seed + gen * 1009)
+        batch = sample_batch(rng, task)
+        if batch is None:
+            hint = TaskDetective.detect_pattern(batch)
+            self.pool = [seed_learner_genome(rng, hint) for _ in range(pop_size)]
+            return {"gen": gen, "accepted": False, "reason": "no_batch"}
+
+        scored: List[Tuple[LearnerGenome, EvalResult]] = []
+        all_results: List[Tuple[LearnerGenome, EvalResult]] = []
+        for g in self.pool:
+            res = evaluate_learner(g, batch, task.name, self.meta.adapt_steps, self.meta.complexity_lambda)
+            all_results.append((g, res))
+            if res.ok:
+                scored.append((g, res))
+
+        MetaCognitiveEngine.analyze_execution(all_results, self.meta)
+
+        if not scored:
+            hint = TaskDetective.detect_pattern(batch)
+            self.pool = [seed_learner_genome(rng, hint) for _ in range(pop_size)]
+            return {"gen": gen, "accepted": False, "reason": "reseed"}
+
+        scored.sort(key=lambda t: t[1].score)
+        best_g0, best_res0 = scored[0]
+        MAP_ELITES_LEARNER.add(best_g0, best_res0.score)
+
+        sel_ctx = {
+            "pool": [g for g, _ in scored],
+            "scores": [res.score for _, res in scored],
+            "pop_size": pop_size,
+            "map_elites": MAP_ELITES_LEARNER,
+            "rng": rng,
+        }
+        sel_res = safe_exec_engine(self.meta.strategy.selection_code, sel_ctx)
+        if sel_res and isinstance(sel_res, (tuple, list)) and len(sel_res) == 2:
+            elites, parenting_pool = sel_res
+        else:
+            elites = [g for g, _ in scored[: max(4, pop_size // 10)]]
+            parenting_pool = [rng.choice(elites) for _ in range(pop_size - len(elites))]
+
+        candidates: List[LearnerGenome] = []
+        needed = pop_size - len(elites)
+        attempts_needed = max(needed * 2, needed + 8)
+        mate_pool = list(elites) + list(parenting_pool)
+
+        while len(candidates) < attempts_needed:
+            parent = rng.choice(parenting_pool) if parenting_pool else rng.choice(elites)
+            child = parent
+            op_tag = "copy"
+
+            if rng.random() < self.meta.crossover_rate and len(mate_pool) > 1:
+                p2 = rng.choice(mate_pool)
+                new_encode = safe_exec_engine(self.meta.strategy.crossover_code, {"p1": parent.encode_stmts, "p2": p2.encode_stmts, "rng": rng})
+                new_predict = safe_exec_engine(self.meta.strategy.crossover_code, {"p1": parent.predict_stmts, "p2": p2.predict_stmts, "rng": rng})
+                new_update = safe_exec_engine(self.meta.strategy.crossover_code, {"p1": parent.update_stmts, "p2": p2.update_stmts, "rng": rng})
+                new_objective = safe_exec_engine(self.meta.strategy.crossover_code, {"p1": parent.objective_stmts, "p2": p2.objective_stmts, "rng": rng})
+                if all(isinstance(v, list) for v in (new_encode, new_predict, new_update, new_objective)):
+                    child = LearnerGenome(new_encode, new_predict, new_update, new_objective, parents=[parent.gid], op_tag="crossover")
+                    op_tag = "crossover"
+
+            if op_tag in ("copy", "crossover") and rng.random() < self.meta.mutation_rate:
+                child = mutate_learner(rng, child, self.meta)
+                op_tag = child.op_tag
+
+            candidates.append(child)
+
+        with_pred = [(c, SURROGATE.predict(c.code)) for c in candidates]
+        with_pred.sort(key=lambda x: x[1])
+        selected_children = [c for c, _ in with_pred[:needed]]
+
+        self.pool = list(elites) + selected_children
+
+        if rng.random() < 0.02:
+            maybe_evolve_operators_lib(rng)
+
+        if gen % 5 == 0:
+            induce_grammar([Genome(statements=["return x"])])
+
+        best_g, best_res = scored[0]
+        old_score = self.best_score
+        accepted = best_res.score < self.best_score - 1e-9
+        if accepted:
+            self.best = best_g
+            self.best_score = best_res.score
+            self.best_hold = best_res.hold
+            self.best_stress = best_res.stress
+
+        op_used = best_g.op_tag.split(":")[1].split("|")[0] if ":" in best_g.op_tag else "unknown"
+        self.meta.update(op_used, self.best_score - old_score, accepted)
+
+        log = {
+            "gen": gen,
+            "accepted": accepted,
+            "score": self.best_score,
+            "hold": self.best_hold,
+            "stress": self.best_stress,
+            "code": self.best.code if self.best else "none",
+        }
+        self.history.append(log)
+        if gen % 5 == 0:
+            SURROGATE.train(self.history)
+        return log
+
+    def snapshot(self) -> Dict:
+        return {
+            "uid": self.uid,
+            "seed": self.seed,
+            "meta": asdict(self.meta),
+            "best": asdict(self.best) if self.best else None,
+            "best_score": self.best_score,
+            "best_hold": self.best_hold,
+            "best_stress": self.best_stress,
+            "pool": [asdict(g) for g in self.pool[:20]],
+            "library": self.library.snapshot(),
+            "history": self.history[-50:],
+        }
+
+    @staticmethod
+    def from_snapshot(s: Dict) -> "UniverseLearner":
+        meta_data = s.get("meta", {})
+        if "strategy" in meta_data and isinstance(meta_data["strategy"], dict):
+            meta_data["strategy"] = EngineStrategy(**meta_data["strategy"])
+        meta = MetaState(**{k: v for k, v in meta_data.items() if k != "op_weights"})
+        meta.op_weights = meta_data.get("op_weights", dict(OP_WEIGHT_INIT))
+        pool = [LearnerGenome(**g) for g in s.get("pool", [])]
+        lib = FunctionLibrary.from_snapshot(s.get("library", {}))
+        u = UniverseLearner(uid=s.get("uid", 0), seed=s.get("seed", 0), meta=meta, pool=pool, library=lib)
+        if s.get("best"):
+            u.best = LearnerGenome(**s["best"])
+        u.best_score = s.get("best_score", float("inf"))
+        u.best_hold = s.get("best_hold", float("inf"))
+        u.best_stress = s.get("best_stress", float("inf"))
+        u.history = s.get("history", [])
+        return u
+
+
 # ---------------------------
 # State persistence
 # ---------------------------
@@ -1482,6 +1902,7 @@ class GlobalState:
     universes: List[Dict]
     selected_uid: int = 0
     generations_done: int = 0
+    mode: str = "solver"
 
 STATE_DIR = Path(".rsi_state")
 
@@ -1500,16 +1921,25 @@ def save_state(gs: GlobalState):
     gs.updated_ms = now_ms()
     write_json(STATE_DIR / "state.json", asdict(gs))
     save_operators_lib(STATE_DIR / "operators_lib.json")
-    save_map_elites(STATE_DIR / "map_elites.json")
+    if gs.mode == "learner":
+        save_map_elites(STATE_DIR / map_elites_filename("learner"), MAP_ELITES_LEARNER)
+    else:
+        save_map_elites(STATE_DIR / map_elites_filename("solver"), MAP_ELITES)
 
 def load_state() -> Optional[GlobalState]:
     p = STATE_DIR / "state.json"
     if not p.exists():
         return None
     try:
+        data = read_json(p)
+        mode = data.get("mode", "solver")
         load_operators_lib(STATE_DIR / "operators_lib.json")
-        load_map_elites(STATE_DIR / "map_elites.json")
-        return GlobalState(**read_json(p))
+        if mode == "learner":
+            load_map_elites(STATE_DIR / map_elites_filename("learner"), MAP_ELITES_LEARNER)
+        else:
+            load_map_elites(STATE_DIR / map_elites_filename("solver"), MAP_ELITES)
+        data["mode"] = mode
+        return GlobalState(**data)
     except Exception:
         return None
 
@@ -1522,27 +1952,44 @@ def run_multiverse(
     n_univ: int,
     resume: bool = False,
     save_every: int = 5,
+    mode: str = "solver",
 ) -> GlobalState:
     safe_mkdir(STATE_DIR)
 
     if resume and (gs0 := load_state()):
-        us = [Universe.from_snapshot(s) for s in gs0.universes]
+        mode = gs0.mode
+        if mode == "learner":
+            us = [UniverseLearner.from_snapshot(s) for s in gs0.universes]
+        else:
+            us = [Universe.from_snapshot(s) for s in gs0.universes]
         start = gs0.generations_done
     else:
         b0 = sample_batch(random.Random(seed), task)
         hint = TaskDetective.detect_pattern(b0)
         if hint:
             print(f"[Detective] Detected pattern: {hint}. Injecting smart seeds.")
-        us = [
-            Universe(
-                uid=i,
-                seed=seed + i * 9973,
-                meta=MetaState(),
-                pool=[seed_genome(random.Random(seed + i), hint) for _ in range(pop)],
-                library=FunctionLibrary(),
-            )
-            for i in range(n_univ)
-        ]
+        if mode == "learner":
+            us = [
+                UniverseLearner(
+                    uid=i,
+                    seed=seed + i * 9973,
+                    meta=MetaState(),
+                    pool=[seed_learner_genome(random.Random(seed + i), hint) for _ in range(pop)],
+                    library=FunctionLibrary(),
+                )
+                for i in range(n_univ)
+            ]
+        else:
+            us = [
+                Universe(
+                    uid=i,
+                    seed=seed + i * 9973,
+                    meta=MetaState(),
+                    pool=[seed_genome(random.Random(seed + i), hint) for _ in range(pop)],
+                    library=FunctionLibrary(),
+                )
+                for i in range(n_univ)
+            ]
         start = 0
 
     for gen in range(start, start + gens):
@@ -1558,7 +2005,7 @@ def run_multiverse(
 
         if save_every > 0 and (gen + 1) % save_every == 0:
             gs = GlobalState(
-                "RSI_EXT_FIXED_v1",
+                "RSI_EXTENDED_v2",
                 now_ms(),
                 now_ms(),
                 seed,
@@ -1566,11 +2013,12 @@ def run_multiverse(
                 [u.snapshot() for u in us],
                 us[0].uid,
                 gen + 1,
+                mode=mode,
             )
             save_state(gs)
 
     gs = GlobalState(
-        "RSI_EXT_FIXED_v1",
+        "RSI_EXTENDED_v2",
         now_ms(),
         now_ms(),
         seed,
@@ -1578,6 +2026,7 @@ def run_multiverse(
         [u.snapshot() for u in us],
         us[0].uid,
         start + gens,
+        mode=mode,
     )
     save_state(gs)
     return gs
@@ -1761,32 +2210,53 @@ def propose_patches(gs: GlobalState, levels: List[int]) -> List[PatchPlan]:
     rng.shuffle(plans)
     return plans[:8]
 
-def probe_run(script: Path, gens: int = 15, pop: int = 32) -> float:
-    with tempfile.TemporaryDirectory() as td:
-        try:
-            proc = subprocess.run(
-                [sys.executable, str(script), "evolve", "--fresh", "--generations", str(gens),
-                 "--population", str(pop), "--universes", "1", "--state-dir", td],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            for line in reversed(proc.stdout.splitlines()):
-                if "Score:" in line:
-                    m = re.search(r"Score:\s*([\d.]+)", line)
-                    if m:
-                        return float(m.group(1))
-        except Exception:
-            pass
-    return float("inf")
+def _probe_tasks(task_name: str) -> List[str]:
+    if task_name == "poly2":
+        return ["poly2", "poly3"]
+    if task_name in ("sort", "reverse", "filter", "max"):
+        return [task_name, "reverse" if task_name != "reverse" else "sort"]
+    return [task_name]
 
-def run_deep_autopatch(levels: List[int], candidates: int = 4, apply: bool = False) -> Dict:
+def probe_run(script: Path, mode: str, task_name: str, gens: int = 5, pop: int = 16) -> float:
+    """PHASE D: probe on multiple seeds/tasks to avoid overfitting."""
+    seeds = [11, 23, 37]
+    tasks = _probe_tasks(task_name)
+    scores: List[float] = []
+    cmd_name = "learner-evolve" if mode == "learner" else "evolve"
+
+    with tempfile.TemporaryDirectory() as td:
+        for seed in seeds:
+            for task in tasks:
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(script), cmd_name, "--fresh", "--generations", str(gens),
+                         "--population", str(pop), "--universes", "1", "--state-dir", td, "--seed", str(seed), "--task", task],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    for line in reversed(proc.stdout.splitlines()):
+                        if "Score:" in line:
+                            m = re.search(r"Score:\s*([\d.]+)", line)
+                            if m:
+                                scores.append(float(m.group(1)))
+                                break
+                except Exception:
+                    scores.append(float("inf"))
+    if not scores:
+        return float("inf")
+    return sum(scores) / len(scores)
+
+def run_deep_autopatch(levels: List[int], candidates: int = 4, apply: bool = False, mode: str = "solver") -> Dict:
     gs = load_state()
     if not gs:
         return {"error": "No state. Run evolve first."}
 
+    mode = mode or gs.mode
+    task_name = gs.task.get("name", "poly2") if isinstance(gs.task, dict) else "poly2"
+
     script = Path(__file__).resolve()
-    baseline = probe_run(script)
+    baseline = probe_run(script, mode, task_name)
     print(f"[AUTOPATCH L{levels}] Baseline: {baseline:.4f}")
 
     plans = propose_patches(gs, levels)[:candidates]
@@ -1801,7 +2271,7 @@ def run_deep_autopatch(levels: List[int], candidates: int = 4, apply: bool = Fal
             f.write(p.new_source)
             tmp = Path(f.name)
         try:
-            score = probe_run(tmp)
+            score = probe_run(tmp, mode, task_name)
             improved = score < baseline - 1e-6
             results.append({"level": p.level, "id": p.patch_id, "title": p.title, "score": score, "improved": improved})
             print(f"[L{p.level}] {p.patch_id}: {p.title} -> {score:.4f} {'OK' if improved else 'FAIL'}")
@@ -1826,15 +2296,15 @@ def run_deep_autopatch(levels: List[int], candidates: int = 4, apply: bool = Fal
 
     return {"improved": False, "baseline": baseline, "results": results}
 
-def run_rsi_loop(gens_per_round: int, rounds: int, levels: List[int], pop: int, n_univ: int):
+def run_rsi_loop(gens_per_round: int, rounds: int, levels: List[int], pop: int, n_univ: int, mode: str):
     task = TaskSpec()
     seed = int(time.time()) % 100000
     for r in range(rounds):
         print(f"\n{'='*60}\n[RSI ROUND {r+1}/{rounds}]\n{'='*60}")
         print(f"[EVOLVE] {gens_per_round} generations...")
-        run_multiverse(seed, task, gens_per_round, pop, n_univ, resume=(r > 0))
+        run_multiverse(seed, task, gens_per_round, pop, n_univ, resume=(r > 0), mode=mode)
         print(f"[AUTOPATCH] Trying L{levels}...")
-        result = run_deep_autopatch(levels, candidates=4, apply=True)
+        result = run_deep_autopatch(levels, candidates=4, apply=True, mode=mode)
         if result.get("applied"):
             print("[RSI] Self-modified! Reloading...")
 
@@ -1856,6 +2326,12 @@ def cmd_selftest(args):
     assert b is not None
     r = evaluate(g, b, t.name)
     assert isinstance(r.score, float)
+
+    hint = TaskDetective.detect_pattern(b)
+    lg = seed_learner_genome(random.Random(42), hint)
+    lr = evaluate_learner(lg, b, t.name)
+    assert isinstance(lr.score, float)
+
     print("[selftest] OK")
     return 0
 
@@ -1863,7 +2339,15 @@ def cmd_evolve(args):
     global STATE_DIR
     STATE_DIR = Path(args.state_dir)
     resume = bool(args.resume) and (not args.fresh)
-    run_multiverse(args.seed, TaskSpec(name=args.task), args.generations, args.population, args.universes, resume=resume, save_every=args.save_every)
+    run_multiverse(args.seed, TaskSpec(name=args.task), args.generations, args.population, args.universes, resume=resume, save_every=args.save_every, mode="solver")
+    print(f"\n[OK] State saved to {STATE_DIR / 'state.json'}")
+    return 0
+
+def cmd_learner_evolve(args):
+    global STATE_DIR
+    STATE_DIR = Path(args.state_dir)
+    resume = bool(args.resume) and (not args.fresh)
+    run_multiverse(args.seed, TaskSpec(name=args.task), args.generations, args.population, args.universes, resume=resume, save_every=args.save_every, mode="learner")
     print(f"\n[OK] State saved to {STATE_DIR / 'state.json'}")
     return 0
 
@@ -1877,7 +2361,10 @@ def cmd_best(args):
     u = next((s for s in gs.universes if s.get("uid") == gs.selected_uid), gs.universes[0] if gs.universes else {})
     best = u.get("best")
     if best:
-        g = Genome(**best)
+        if gs.mode == "learner":
+            g = LearnerGenome(**best)
+        else:
+            g = Genome(**best)
         print(g.code)
     print(f"Score: {u.get('best_score')} | Hold: {u.get('best_hold')} | Stress: {u.get('best_stress')}")
     print(f"Generations: {gs.generations_done}")
@@ -1887,7 +2374,8 @@ def cmd_autopatch(args):
     global STATE_DIR
     STATE_DIR = Path(args.state_dir)
     levels = [int(l) for l in args.levels.split(",") if l.strip()]
-    result = run_deep_autopatch(levels, args.candidates, args.apply)
+    mode = args.mode or ""
+    result = run_deep_autopatch(levels, args.candidates, args.apply, mode=mode)
     print(json.dumps(result, indent=2, default=str))
     return 0
 
@@ -1895,11 +2383,11 @@ def cmd_rsi_loop(args):
     global STATE_DIR
     STATE_DIR = Path(args.state_dir)
     levels = [int(l) for l in args.levels.split(",") if l.strip()]
-    run_rsi_loop(args.generations, args.rounds, levels, args.population, args.universes)
+    run_rsi_loop(args.generations, args.rounds, levels, args.population, args.universes, mode=args.mode)
     return 0
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="UNIFIED_RSI_EXTENDED_FIXED", description="True RSI Engine with L0-L5 Self-Modification (Fixed)")
+    p = argparse.ArgumentParser(prog="UNIFIED_RSI_EXTENDED", description="True RSI Engine with L0-L5 Self-Modification")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("selftest")
@@ -1917,6 +2405,18 @@ def build_parser():
     e.add_argument("--state-dir", default=".rsi_state")
     e.set_defaults(fn=cmd_evolve)
 
+    le = sub.add_parser("learner-evolve")
+    le.add_argument("--seed", type=int, default=1337)
+    le.add_argument("--generations", type=int, default=80)
+    le.add_argument("--population", type=int, default=128)
+    le.add_argument("--universes", type=int, default=4)
+    le.add_argument("--task", default="poly2")
+    le.add_argument("--resume", action="store_true")
+    le.add_argument("--fresh", action="store_true")
+    le.add_argument("--save-every", type=int, default=5)
+    le.add_argument("--state-dir", default=".rsi_state")
+    le.set_defaults(fn=cmd_learner_evolve)
+
     b = sub.add_parser("best")
     b.add_argument("--state-dir", default=".rsi_state")
     b.set_defaults(fn=cmd_best)
@@ -1926,6 +2426,7 @@ def build_parser():
     a.add_argument("--candidates", type=int, default=4)
     a.add_argument("--apply", action="store_true")
     a.add_argument("--state-dir", default=".rsi_state")
+    a.add_argument("--mode", default="", choices=["", "solver", "learner"])
     a.set_defaults(fn=cmd_autopatch)
 
     r = sub.add_parser("rsi-loop")
@@ -1935,6 +2436,7 @@ def build_parser():
     r.add_argument("--population", type=int, default=64)
     r.add_argument("--universes", type=int, default=2)
     r.add_argument("--state-dir", default=".rsi_state")
+    r.add_argument("--mode", default="solver", choices=["solver", "learner"])
     r.set_defaults(fn=cmd_rsi_loop)
 
     return p
