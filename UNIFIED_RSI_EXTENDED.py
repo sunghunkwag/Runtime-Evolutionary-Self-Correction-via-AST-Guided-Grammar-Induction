@@ -16,6 +16,9 @@ CLI:
   python UNIFIED_RSI_EXTENDED.py selftest
   python UNIFIED_RSI_EXTENDED.py evolve --fresh --generations 100
   python UNIFIED_RSI_EXTENDED.py learner-evolve --fresh --generations 100
+  python UNIFIED_RSI_EXTENDED.py meta-meta --episodes 20 --gens-per-episode 20
+  python UNIFIED_RSI_EXTENDED.py task-switch --task-a poly2 --task-b piecewise
+  python UNIFIED_RSI_EXTENDED.py report --state-dir .rsi_state
   python UNIFIED_RSI_EXTENDED.py autopatch --levels 0,1,3 --apply
   python UNIFIED_RSI_EXTENDED.py rsi-loop --generations 50 --rounds 10
   python UNIFIED_RSI_EXTENDED.py rsi-loop --generations 20 --rounds 5 --mode learner
@@ -76,6 +79,70 @@ def unified_diff(old: str, new: str, name: str) -> str:
             tofile=name,
         )
     )
+
+
+class RunLogger:
+    def __init__(self, path: Path, window: int = 10, append: bool = False):
+        self.path = path
+        self.window = window
+        self.records: List[Dict[str, Any]] = []
+        self.best_scores: List[float] = []
+        self.best_hold: List[float] = []
+        self.seen_hashes: Set[str] = set()
+        safe_mkdir(self.path.parent)
+        if self.path.exists() and not append:
+            self.path.unlink()
+
+    def _window_slice(self, vals: List[float]) -> List[float]:
+        if not vals:
+            return []
+        return vals[-self.window :]
+
+    def log(
+        self,
+        gen: int,
+        task_id: str,
+        mode: str,
+        score_hold: float,
+        score_stress: float,
+        score_test: float,
+        runtime_ms: int,
+        nodes: int,
+        code_hash: str,
+        accepted: bool,
+        novelty: float,
+        meta_policy_params: Dict[str, Any],
+        task_descriptor: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self.best_scores.append(score_hold)
+        self.best_hold.append(score_hold)
+        window_vals = self._window_slice(self.best_hold)
+        auc_window = sum(window_vals) / max(1, len(window_vals))
+        if len(self.best_hold) > self.window:
+            delta_best_window = self.best_hold[-1] - self.best_hold[-self.window]
+        else:
+            delta_best_window = self.best_hold[-1] - self.best_hold[0]
+        record = {
+            "gen": gen,
+            "task_id": task_id,
+            "mode": mode,
+            "score_hold": score_hold,
+            "score_stress": score_stress,
+            "score_test": score_test,
+            "auc_window": auc_window,
+            "delta_best_window": delta_best_window,
+            "runtime_ms": runtime_ms,
+            "nodes": nodes,
+            "hash": code_hash,
+            "accepted": accepted,
+            "novelty": novelty,
+            "meta_policy_params": meta_policy_params,
+            "task_descriptor": task_descriptor,
+        }
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        self.records.append(record)
+        return record
 
 
 # ---------------------------
@@ -472,15 +539,93 @@ def run():
 # ---------------------------
 
 @dataclass
+class TaskDescriptor:
+    name: str
+    family: str
+    input_kind: str
+    output_kind: str
+    n_train: int
+    n_hold: int
+    n_test: int
+    noise: float
+    stress_mult: float
+    has_switch: bool
+    nonlinear: bool
+
+    def vector(self) -> List[float]:
+        family_map = {
+            "poly": 0.1,
+            "piecewise": 0.3,
+            "rational": 0.5,
+            "switching": 0.7,
+            "classification": 0.9,
+            "list": 0.2,
+            "arc": 0.4,
+            "other": 0.6,
+        }
+        return [
+            family_map.get(self.family, 0.0),
+            1.0 if self.input_kind == "list" else 0.0,
+            1.0 if self.input_kind == "grid" else 0.0,
+            1.0 if self.output_kind == "class" else 0.0,
+            float(self.n_train) / 100.0,
+            float(self.n_hold) / 100.0,
+            float(self.n_test) / 100.0,
+            clamp(self.noise, 0.0, 1.0),
+            clamp(self.stress_mult / 5.0, 0.0, 2.0),
+            1.0 if self.has_switch else 0.0,
+            1.0 if self.nonlinear else 0.0,
+        ]
+
+    def snapshot(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class TaskSpec:
     name: str = "poly2"
     x_min: float = -3.0
     x_max: float = 3.0
     n_train: int = 96
     n_hold: int = 96
+    n_test: int = 96
     noise: float = 0.01
     stress_mult: float = 3.0
     target_code: Optional[str] = None
+    descriptor: Optional[TaskDescriptor] = None
+
+    def ensure_descriptor(self) -> TaskDescriptor:
+        if self.descriptor:
+            return self.descriptor
+        family = "other"
+        if self.name in ("poly2", "poly3"):
+            family = "poly"
+        elif self.name == "piecewise":
+            family = "piecewise"
+        elif self.name == "rational":
+            family = "rational"
+        elif self.name == "switching":
+            family = "switching"
+        elif self.name == "classification":
+            family = "classification"
+        elif self.name in ("sort", "reverse", "filter", "max", "even_reverse_sort"):
+            family = "list"
+        elif self.name.startswith("arc_"):
+            family = "arc"
+        self.descriptor = TaskDescriptor(
+            name=self.name,
+            family=family,
+            input_kind="list" if family == "list" else ("grid" if family == "arc" else "scalar"),
+            output_kind="class" if family == "classification" else "scalar",
+            n_train=self.n_train,
+            n_hold=self.n_hold,
+            n_test=self.n_test,
+            noise=self.noise,
+            stress_mult=self.stress_mult,
+            has_switch=self.name == "switching",
+            nonlinear=family in ("poly", "piecewise", "rational", "switching"),
+        )
+        return self.descriptor
 
 
 TARGET_FNS = {
@@ -493,8 +638,11 @@ TARGET_FNS = {
     "arc_inv": lambda x: [[1 - c if c in (0, 1) else c for c in r] for r in x],
     "poly2": lambda x: 0.7 * x * x - 0.2 * x + 0.3,
     "poly3": lambda x: 0.3 * x ** 3 - 0.5 * x + 0.1,
+    "piecewise": lambda x: (-0.5 * x + 1.0) if x < 0 else (0.3 * x * x + 0.1),
+    "rational": lambda x: (x * x + 1.0) / (1.0 + 0.5 * abs(x)),
     "sinmix": lambda x: math.sin(x) + 0.3 * math.cos(2 * x),
     "absline": lambda x: abs(x) + 0.2 * x,
+    "classification": lambda x: 1.0 if (x + 0.25 * math.sin(3 * x)) > 0 else 0.0,
 }
 
 
@@ -523,6 +671,8 @@ class Batch:
     y_ho: List[Any]
     x_st: List[Any]
     y_st: List[Any]
+    x_te: List[Any]
+    y_te: List[Any]
 
 def sample_batch(rng: random.Random, t: TaskSpec) -> Optional[Batch]:
     # function target
@@ -549,6 +699,7 @@ def sample_batch(rng: random.Random, t: TaskSpec) -> Optional[Batch]:
             x_all[:20], y_all[:20],
             x_all[:10], y_all[:10],
             x_all[:5],  y_all[:5],
+            x_all[5:10], y_all[5:10],
         )
 
     # list tasks
@@ -569,7 +720,9 @@ def sample_batch(rng: random.Random, t: TaskSpec) -> Optional[Batch]:
         y_tr = [f(x) for x in x_tr]
         y_ho = [f(x) for x in x_ho]
         y_st = [f(x) for x in x_st]
-        return Batch(x_tr, y_tr, x_ho, y_ho, x_st, y_st)
+        x_te = gen_lists(max(1, t.n_test), t.x_min + 1, t.x_max + 1)
+        y_te = [f(x) for x in x_te]
+        return Batch(x_tr, y_tr, x_ho, y_ho, x_st, y_st, x_te, y_te)
 
     if t.name in ("sort", "reverse", "filter", "max"):
         x_tr = gen_lists(t.n_train, t.x_min, t.x_max)
@@ -578,7 +731,9 @@ def sample_batch(rng: random.Random, t: TaskSpec) -> Optional[Batch]:
         y_tr = [f(x) for x in x_tr]
         y_ho = [f(x) for x in x_ho]
         y_st = [f(x) for x in x_st]
-        return Batch(x_tr, y_tr, x_ho, y_ho, x_st, y_st)
+        x_te = gen_lists(max(1, t.n_test), t.x_min + 1, t.x_max + 1)
+        y_te = [f(x) for x in x_te]
+        return Batch(x_tr, y_tr, x_ho, y_ho, x_st, y_st, x_te, y_te)
 
     # synthetic ARC-like generators if name starts with arc_
     if t.name.startswith("arc_"):
@@ -595,7 +750,32 @@ def sample_batch(rng: random.Random, t: TaskSpec) -> Optional[Batch]:
         y_tr = [f(x) for x in x_tr]
         y_ho = [f(x) for x in x_ho]
         y_st = [f(x) for x in x_st]
-        return Batch(x_tr, y_tr, x_ho, y_ho, x_st, y_st)
+        x_te = gen_grids(10, dim)
+        y_te = [f(x) for x in x_te]
+        return Batch(x_tr, y_tr, x_ho, y_ho, x_st, y_st, x_te, y_te)
+
+    if t.name == "switching":
+        def target_switch(pair):
+            x, s = pair
+            return TARGET_FNS["poly2"](x) if s < 0.5 else TARGET_FNS["sinmix"](x)
+
+        def gen_pairs(k, a, b):
+            data = []
+            for _ in range(k):
+                x = a + (b - a) * rng.random()
+                s = 1.0 if rng.random() > 0.5 else 0.0
+                data.append([x, s])
+            return data
+
+        x_tr = gen_pairs(t.n_train, t.x_min, t.x_max)
+        x_ho = gen_pairs(t.n_hold, t.x_min, t.x_max)
+        x_st = gen_pairs(t.n_hold, t.x_min * t.stress_mult, t.x_max * t.stress_mult)
+        x_te = gen_pairs(t.n_test, t.x_min, t.x_max)
+        y_tr = [target_switch(x) for x in x_tr]
+        y_ho = [target_switch(x) for x in x_ho]
+        y_st = [target_switch(x) for x in x_st]
+        y_te = [target_switch(x) for x in x_te]
+        return Batch(x_tr, y_tr, x_ho, y_ho, x_st, y_st, x_te, y_te)
 
     # numeric regression tasks
     xs = lambda n, a, b: [a + (b - a) * rng.random() for _ in range(n)]
@@ -605,7 +785,51 @@ def sample_batch(rng: random.Random, t: TaskSpec) -> Optional[Batch]:
     x_tr = xs(t.n_train, t.x_min, t.x_max)
     x_ho = xs(t.n_hold, t.x_min, t.x_max)
     x_st = xs(t.n_hold, mid - half * t.stress_mult, mid + half * t.stress_mult)
-    return Batch(x_tr, ys(x_tr, t.noise), x_ho, ys(x_ho, t.noise), x_st, ys(x_st, t.noise * t.stress_mult))
+    x_te = xs(t.n_test, t.x_min, t.x_max)
+    return Batch(
+        x_tr, ys(x_tr, t.noise),
+        x_ho, ys(x_ho, t.noise),
+        x_st, ys(x_st, t.noise * t.stress_mult),
+        x_te, ys(x_te, t.noise),
+    )
+
+
+def task_suite(seed: int) -> List[TaskSpec]:
+    base = [
+        TaskSpec(name="poly2", x_min=-3.0, x_max=3.0, n_train=96, n_hold=64, n_test=64, noise=0.01),
+        TaskSpec(name="piecewise", x_min=-4.0, x_max=4.0, n_train=96, n_hold=64, n_test=64, noise=0.01),
+        TaskSpec(name="rational", x_min=-5.0, x_max=5.0, n_train=96, n_hold=64, n_test=64, noise=0.02),
+        TaskSpec(name="switching", x_min=-3.0, x_max=3.0, n_train=96, n_hold=64, n_test=64, noise=0.0),
+        TaskSpec(name="classification", x_min=-4.0, x_max=4.0, n_train=96, n_hold=64, n_test=64, noise=0.0),
+    ]
+    rng = random.Random(seed)
+    rng.shuffle(base)
+    return base
+
+
+def split_meta_tasks(seed: int, meta_train_ratio: float = 0.6) -> Tuple[List[TaskSpec], List[TaskSpec]]:
+    suite = task_suite(seed)
+    cut = max(1, int(len(suite) * meta_train_ratio))
+    return suite[:cut], suite[cut:]
+
+
+FROZEN_BATCH_CACHE: Dict[str, Batch] = {}
+
+
+def _task_cache_key(task: TaskSpec, seed: int) -> str:
+    return f"{task.name}:{seed}:{task.x_min}:{task.x_max}:{task.n_train}:{task.n_hold}:{task.n_test}:{task.noise}:{task.stress_mult}:{task.target_code}"
+
+
+def get_task_batch(task: TaskSpec, seed: int, freeze_eval: bool = True) -> Optional[Batch]:
+    key = _task_cache_key(task, seed)
+    if freeze_eval and key in FROZEN_BATCH_CACHE:
+        return FROZEN_BATCH_CACHE[key]
+    h = int(sha256(key)[:8], 16)
+    rng = random.Random(h if freeze_eval else seed)
+    batch = sample_batch(rng, task)
+    if freeze_eval and batch is not None:
+        FROZEN_BATCH_CACHE[key] = batch
+    return batch
 
 
 # ---------------------------
@@ -688,6 +912,7 @@ class EvalResult:
     train: float
     hold: float
     stress: float
+    test: float
     nodes: int
     score: float
     err: Optional[str] = None
@@ -809,11 +1034,12 @@ def evaluate(g: Genome, b: Batch, task_name: str, lam: float = 0.0001, extra_env
     ok1, tr, e1 = mse_exec(code, b.x_tr, b.y_tr, task_name, extra_env=extra_env)
     ok2, ho, e2 = mse_exec(code, b.x_ho, b.y_ho, task_name, extra_env=extra_env)
     ok3, st, e3 = mse_exec(code, b.x_st, b.y_st, task_name, extra_env=extra_env)
-    ok = ok1 and ok2 and ok3 and all(math.isfinite(v) for v in (tr, ho, st))
+    ok4, te, e4 = mse_exec(code, b.x_te, b.y_te, task_name, extra_env=extra_env)
+    ok = ok1 and ok2 and ok3 and ok4 and all(math.isfinite(v) for v in (tr, ho, st, te))
     nodes = node_count(code)
     score = SCORE_W_HOLD * ho + SCORE_W_STRESS * st + SCORE_W_TRAIN * tr + lam * nodes
-    err = e1 or e2 or e3
-    return EvalResult(ok, tr, ho, st, nodes, score, err or None)
+    err = e1 or e2 or e3 or e4
+    return EvalResult(ok, tr, ho, st, te, nodes, score, err or None)
 
 
 def evaluate_learner(
@@ -826,10 +1052,10 @@ def evaluate_learner(
     """PHASE B: evaluate learner with adaptation on training only."""
     env = safe_load_module(learner.code)
     if not env:
-        return EvalResult(False, float("inf"), float("inf"), float("inf"), 0, float("inf"), "load_failed")
+        return EvalResult(False, float("inf"), float("inf"), float("inf"), float("inf"), 0, float("inf"), "load_failed")
     required = ["init_mem", "encode", "predict", "update", "objective"]
     if not all(name in env and callable(env[name]) for name in required):
-        return EvalResult(False, float("inf"), float("inf"), float("inf"), 0, float("inf"), "missing_funcs")
+        return EvalResult(False, float("inf"), float("inf"), float("inf"), float("inf"), 0, float("inf"), "missing_funcs")
 
     init_mem = env["init_mem"]
     encode = env["encode"]
@@ -866,15 +1092,16 @@ def evaluate_learner(
         train = run_eval(b.x_tr, b.y_tr, do_update=True)
         hold = run_eval(b.x_ho, b.y_ho, do_update=False)
         stress = run_eval(b.x_st, b.y_st, do_update=False)
+        test = run_eval(b.x_te, b.y_te, do_update=False)
         nodes = node_count(learner.code)
         obj = objective(train, hold, stress, nodes)
         if not isinstance(obj, (int, float)) or not math.isfinite(obj):
             obj = SCORE_W_HOLD * hold + SCORE_W_STRESS * stress + SCORE_W_TRAIN * train
         score = float(obj) + lam * nodes
-        ok = all(math.isfinite(v) for v in (train, hold, stress, score))
-        return EvalResult(ok, train, hold, stress, nodes, score, None if ok else "nan")
+        ok = all(math.isfinite(v) for v in (train, hold, stress, test, score))
+        return EvalResult(ok, train, hold, stress, test, nodes, score, None if ok else "nan")
     except Exception as exc:
-        return EvalResult(False, float("inf"), float("inf"), float("inf"), 0, float("inf"), str(exc))
+        return EvalResult(False, float("inf"), float("inf"), float("inf"), float("inf"), 0, float("inf"), str(exc))
 
 
 # ---------------------------
@@ -1450,12 +1677,49 @@ class FunctionLibrary:
     def snapshot(self) -> Dict:
         return {"funcs": [asdict(f) for f in self.funcs.values()]}
 
+    def merge(self, other: "FunctionLibrary"):
+        for name, func in other.funcs.items():
+            if name not in self.funcs:
+                self.funcs[name] = func
+            else:
+                new_name = f"{name}_{len(self.funcs) + 1}"
+                self.funcs[new_name] = LearnedFunc(name=new_name, expr=func.expr, trust=func.trust, uses=func.uses)
+
     @staticmethod
     def from_snapshot(s: Dict) -> "FunctionLibrary":
         lib = FunctionLibrary()
         for fd in s.get("funcs", []):
             lib.funcs[fd["name"]] = LearnedFunc(**fd)
         return lib
+
+
+@dataclass
+class LibraryRecord:
+    descriptor: TaskDescriptor
+    score_hold: float
+    snapshot: Dict[str, Any]
+
+
+class LibraryArchive:
+    def __init__(self, k: int = 2):
+        self.k = k
+        self.records: List[LibraryRecord] = []
+
+    def add(self, descriptor: TaskDescriptor, score_hold: float, lib: FunctionLibrary):
+        self.records.append(LibraryRecord(descriptor=descriptor, score_hold=score_hold, snapshot=lib.snapshot()))
+
+    def _distance(self, a: List[float], b: List[float]) -> float:
+        return math.sqrt(sum((ai - bi) ** 2 for ai, bi in zip(a, b)))
+
+    def select(self, descriptor: TaskDescriptor) -> List[FunctionLibrary]:
+        if not self.records:
+            return []
+        vec = descriptor.vector()
+        ranked = sorted(self.records, key=lambda r: (self._distance(vec, r.descriptor.vector()), r.score_hold))
+        libs = []
+        for rec in ranked[: self.k]:
+            libs.append(FunctionLibrary.from_snapshot(rec.snapshot))
+        return libs
 
 
 # ---------------------------
@@ -1489,6 +1753,30 @@ def induce_grammar(pool: List[Genome]):
             old = GRAMMAR_PROBS.get(k, 1.0)
             target = counts[k] / total * 100.0
             GRAMMAR_PROBS[k] = 0.8 * old + 0.2 * target
+
+
+def extract_return_expr(stmts: List[str]) -> Optional[str]:
+    for stmt in reversed(stmts):
+        s = stmt.strip()
+        if s.startswith("return "):
+            return s[len("return ") :].strip()
+    return None
+
+
+def inject_helpers_into_statements(rng: random.Random, stmts: List[str], library: FunctionLibrary) -> List[str]:
+    if not library.funcs:
+        return stmts
+    new_stmts = []
+    injected = False
+    for stmt in stmts:
+        if not injected and stmt.strip().startswith("return "):
+            expr = stmt.strip()[len("return ") :].strip()
+            new_expr, helper_name = library.maybe_inject(rng, expr)
+            if helper_name:
+                stmt = f"return {new_expr}"
+                injected = True
+        new_stmts.append(stmt)
+    return new_stmts
 
 
 # ---------------------------
@@ -1561,6 +1849,67 @@ class MetaCognitiveEngine:
 
 
 # ---------------------------
+# L1 Meta-optimizer policy
+# ---------------------------
+
+@dataclass
+class MetaPolicy:
+    weights: List[List[float]]
+    bias: List[float]
+    pid: str = ""
+
+    @staticmethod
+    def seed(rng: random.Random, n_outputs: int, n_inputs: int) -> "MetaPolicy":
+        weights = [[rng.uniform(-0.2, 0.2) for _ in range(n_inputs)] for _ in range(n_outputs)]
+        bias = [rng.uniform(-0.1, 0.1) for _ in range(n_outputs)]
+        pid = sha256(json.dumps(weights) + json.dumps(bias))[:10]
+        return MetaPolicy(weights=weights, bias=bias, pid=pid)
+
+    def _linear(self, features: List[float], idx: int) -> float:
+        w = self.weights[idx]
+        return sum(fi * wi for fi, wi in zip(features, w)) + self.bias[idx]
+
+    def act(self, descriptor: TaskDescriptor, stats: Dict[str, float]) -> Dict[str, Any]:
+        features = descriptor.vector() + [
+            stats.get("delta_best", 0.0),
+            stats.get("auc_window", 0.0),
+            stats.get("timeout_rate", 0.0),
+            stats.get("avg_nodes", 0.0),
+        ]
+        outputs = [self._linear(features, i) for i in range(len(self.weights))]
+        mutation_rate = clamp(0.5 + outputs[0], 0.05, 0.98)
+        crossover_rate = clamp(0.2 + outputs[1], 0.0, 0.9)
+        novelty_weight = clamp(0.2 + outputs[2], 0.0, 1.0)
+        branch_insert_rate = clamp(0.1 + outputs[3], 0.0, 0.6)
+        op_scale = clamp(1.0 + outputs[4], 0.2, 3.0)
+        op_weights = {
+            "modify_return": clamp(OP_WEIGHT_INIT.get("modify_return", 1.0) * op_scale, 0.1, 8.0),
+            "insert_assign": clamp(OP_WEIGHT_INIT.get("insert_assign", 1.0) * (op_scale + 0.2), 0.1, 8.0),
+            "list_manip": clamp(OP_WEIGHT_INIT.get("list_manip", 1.0) * (op_scale - 0.1), 0.1, 8.0),
+        }
+        return {
+            "mutation_rate": mutation_rate,
+            "crossover_rate": crossover_rate,
+            "novelty_weight": novelty_weight,
+            "branch_insert_rate": branch_insert_rate,
+            "op_weights": op_weights,
+        }
+
+    def mutate(self, rng: random.Random, scale: float = 0.1) -> "MetaPolicy":
+        weights = [row[:] for row in self.weights]
+        bias = self.bias[:]
+        for i in range(len(weights)):
+            if rng.random() < 0.7:
+                j = rng.randrange(len(weights[i]))
+                weights[i][j] += rng.uniform(-scale, scale)
+        for i in range(len(bias)):
+            if rng.random() < 0.5:
+                bias[i] += rng.uniform(-scale, scale)
+        pid = sha256(json.dumps(weights) + json.dumps(bias))[:10]
+        return MetaPolicy(weights=weights, bias=bias, pid=pid)
+
+
+# ---------------------------
 # Universe / Multiverse
 # ---------------------------
 
@@ -1576,16 +1925,28 @@ class Universe:
     best_score: float = float("inf")
     best_hold: float = float("inf")
     best_stress: float = float("inf")
+    best_test: float = float("inf")
     history: List[Dict] = field(default_factory=list)
 
-    def step(self, gen: int, task: TaskSpec, pop_size: int) -> Dict:
+    def step(self, gen: int, task: TaskSpec, pop_size: int, batch: Batch, policy_controls: Optional[Dict[str, float]] = None) -> Dict:
         rng = random.Random(self.seed + gen * 1009)
-        batch = sample_batch(rng, task)
         if batch is None:
             self.pool = [seed_genome(rng) for _ in range(pop_size)]
             return {"gen": gen, "accepted": False, "reason": "no_batch"}
 
         helper_env = self.library.get_helpers()
+        if policy_controls:
+            self.meta.mutation_rate = clamp(policy_controls.get("mutation_rate", self.meta.mutation_rate), 0.05, 0.98)
+            self.meta.crossover_rate = clamp(policy_controls.get("crossover_rate", self.meta.crossover_rate), 0.0, 0.95)
+            novelty_weight = clamp(policy_controls.get("novelty_weight", 0.0), 0.0, 1.0)
+            branch_rate = clamp(policy_controls.get("branch_insert_rate", 0.0), 0.0, 0.6)
+            if isinstance(policy_controls.get("op_weights"), dict):
+                for k, v in policy_controls["op_weights"].items():
+                    if k in self.meta.op_weights:
+                        self.meta.op_weights[k] = clamp(float(v), 0.1, 8.0)
+        else:
+            novelty_weight = 0.0
+            branch_rate = 0.0
 
         scored: List[Tuple[Genome, EvalResult]] = []
         all_results: List[Tuple[Genome, EvalResult]] = []
@@ -1603,10 +1964,19 @@ class Universe:
             return {"gen": gen, "accepted": False, "reason": "reseed"}
 
         scored.sort(key=lambda t: t[1].score)
+        timeout_rate = 1.0 - (len(scored) / max(1, len(all_results)))
+        avg_nodes = sum(r.nodes for _, r in scored) / max(1, len(scored))
 
         # MAP-Elites add
         best_g0, best_res0 = scored[0]
         MAP_ELITES.add(best_g0, best_res0.score)
+
+        for g, _ in scored[:3]:
+            expr = extract_return_expr(g.statements)
+            if expr:
+                adopted = self.library.maybe_adopt(rng, expr, threshold=0.3)
+                if adopted:
+                    break
 
         # selection via strategy
         sel_ctx = {
@@ -1660,6 +2030,12 @@ class Universe:
                         new_stmts = OPERATORS[op](rng, new_stmts)
                     op_tag = f"mut:{op}"
 
+            if rng.random() < branch_rate:
+                extra = rng.choice(seed_genome(rng).statements)
+                new_stmts = list(new_stmts) + [extra]
+                op_tag = f"{op_tag}|branch"
+
+            new_stmts = inject_helpers_into_statements(rng, list(new_stmts), self.library)
             candidates.append(Genome(statements=new_stmts, parents=[parent.gid], op_tag=op_tag))
 
         # surrogate ranking
@@ -1686,6 +2062,7 @@ class Universe:
             self.best_score = best_res.score
             self.best_hold = best_res.hold
             self.best_stress = best_res.stress
+            self.best_test = best_res.test
 
         op_used = best_g.op_tag.split(":")[1].split("|")[0] if ":" in best_g.op_tag else "unknown"
         self.meta.update(op_used, self.best_score - old_score, accepted)
@@ -1696,7 +2073,11 @@ class Universe:
             "score": self.best_score,
             "hold": self.best_hold,
             "stress": self.best_stress,
+            "test": self.best_test,
             "code": self.best.code if self.best else "none",
+            "novelty_weight": novelty_weight,
+            "timeout_rate": timeout_rate,
+            "avg_nodes": avg_nodes,
         }
         self.history.append(log)
         if gen % 5 == 0:
@@ -1712,6 +2093,7 @@ class Universe:
             "best_score": self.best_score,
             "best_hold": self.best_hold,
             "best_stress": self.best_stress,
+            "best_test": self.best_test,
             "pool": [asdict(g) for g in self.pool[:20]],
             "library": self.library.snapshot(),
             "history": self.history[-50:],
@@ -1732,6 +2114,7 @@ class Universe:
         u.best_score = s.get("best_score", float("inf"))
         u.best_hold = s.get("best_hold", float("inf"))
         u.best_stress = s.get("best_stress", float("inf"))
+        u.best_test = s.get("best_test", float("inf"))
         u.history = s.get("history", [])
         return u
 
@@ -1749,11 +2132,11 @@ class UniverseLearner:
     best_score: float = float("inf")
     best_hold: float = float("inf")
     best_stress: float = float("inf")
+    best_test: float = float("inf")
     history: List[Dict] = field(default_factory=list)
 
-    def step(self, gen: int, task: TaskSpec, pop_size: int) -> Dict:
+    def step(self, gen: int, task: TaskSpec, pop_size: int, batch: Batch) -> Dict:
         rng = random.Random(self.seed + gen * 1009)
-        batch = sample_batch(rng, task)
         if batch is None:
             hint = TaskDetective.detect_pattern(batch)
             self.pool = [seed_learner_genome(rng, hint) for _ in range(pop_size)]
@@ -1838,6 +2221,7 @@ class UniverseLearner:
             self.best_score = best_res.score
             self.best_hold = best_res.hold
             self.best_stress = best_res.stress
+            self.best_test = best_res.test
 
         op_used = best_g.op_tag.split(":")[1].split("|")[0] if ":" in best_g.op_tag else "unknown"
         self.meta.update(op_used, self.best_score - old_score, accepted)
@@ -1848,6 +2232,7 @@ class UniverseLearner:
             "score": self.best_score,
             "hold": self.best_hold,
             "stress": self.best_stress,
+            "test": self.best_test,
             "code": self.best.code if self.best else "none",
         }
         self.history.append(log)
@@ -1864,6 +2249,7 @@ class UniverseLearner:
             "best_score": self.best_score,
             "best_hold": self.best_hold,
             "best_stress": self.best_stress,
+            "best_test": self.best_test,
             "pool": [asdict(g) for g in self.pool[:20]],
             "library": self.library.snapshot(),
             "history": self.history[-50:],
@@ -1884,6 +2270,7 @@ class UniverseLearner:
         u.best_score = s.get("best_score", float("inf"))
         u.best_hold = s.get("best_hold", float("inf"))
         u.best_stress = s.get("best_stress", float("inf"))
+        u.best_test = s.get("best_test", float("inf"))
         u.history = s.get("history", [])
         return u
 
@@ -1953,8 +2340,11 @@ def run_multiverse(
     resume: bool = False,
     save_every: int = 5,
     mode: str = "solver",
+    freeze_eval: bool = True,
 ) -> GlobalState:
     safe_mkdir(STATE_DIR)
+    logger = RunLogger(STATE_DIR / "run_log.jsonl", append=resume)
+    task.ensure_descriptor()
 
     if resume and (gs0 := load_state()):
         mode = gs0.mode
@@ -1964,7 +2354,7 @@ def run_multiverse(
             us = [Universe.from_snapshot(s) for s in gs0.universes]
         start = gs0.generations_done
     else:
-        b0 = sample_batch(random.Random(seed), task)
+        b0 = get_task_batch(task, seed, freeze_eval=freeze_eval)
         hint = TaskDetective.detect_pattern(b0)
         if hint:
             print(f"[Detective] Detected pattern: {hint}. Injecting smart seeds.")
@@ -1993,13 +2383,39 @@ def run_multiverse(
         start = 0
 
     for gen in range(start, start + gens):
+        start_ms = now_ms()
+        batch = get_task_batch(task, seed, freeze_eval=freeze_eval)
         for u in us:
-            u.step(gen, task, pop)
+            if mode == "learner":
+                u.step(gen, task, pop, batch)
+            else:
+                u.step(gen, task, pop, batch)
 
         us.sort(key=lambda u: u.best_score)
         best = us[0]
+        runtime_ms = now_ms() - start_ms
+        best_code = best.best.code if best.best else "none"
+        code_hash = sha256(best_code)
+        novelty = 1.0 if code_hash not in logger.seen_hashes else 0.0
+        logger.seen_hashes.add(code_hash)
+        accepted = bool(best.history[-1]["accepted"]) if best.history else False
+        logger.log(
+            gen=gen,
+            task_id=task.name,
+            mode=mode,
+            score_hold=best.best_hold,
+            score_stress=best.best_stress,
+            score_test=getattr(best, "best_test", float("inf")),
+            runtime_ms=runtime_ms,
+            nodes=node_count(best_code),
+            code_hash=code_hash,
+            accepted=accepted,
+            novelty=novelty,
+            meta_policy_params={},
+            task_descriptor=task.descriptor.snapshot() if task.descriptor else None,
+        )
         print(
-            f"[Gen {gen + 1:4d}] Score: {best.best_score:.4f} | Hold: {best.best_hold:.4f} | Stress: {best.best_stress:.4f} | "
+            f"[Gen {gen + 1:4d}] Score: {best.best_score:.4f} | Hold: {best.best_hold:.4f} | Stress: {best.best_stress:.4f} | Test: {best.best_test:.4f} | "
             f"{(best.best.code if best.best else 'none')}"
         )
 
@@ -2030,6 +2446,280 @@ def run_multiverse(
     )
     save_state(gs)
     return gs
+
+
+def policy_stats_from_history(history: List[Dict[str, Any]], window: int = 5) -> Dict[str, float]:
+    if not history:
+        return {"delta_best": 0.0, "auc_window": 0.0, "timeout_rate": 0.0, "avg_nodes": 0.0}
+    holds = [h.get("hold", 0.0) for h in history]
+    recent = holds[-window:] if len(holds) >= window else holds
+    auc_window = sum(recent) / max(1, len(recent))
+    if len(holds) >= window:
+        delta_best = holds[-1] - holds[-window]
+    else:
+        delta_best = holds[-1] - holds[0]
+    timeout_rate = history[-1].get("timeout_rate", 0.0)
+    avg_nodes = history[-1].get("avg_nodes", 0.0)
+    return {
+        "delta_best": delta_best,
+        "auc_window": auc_window,
+        "timeout_rate": timeout_rate,
+        "avg_nodes": avg_nodes,
+    }
+
+
+def run_policy_episode(
+    seed: int,
+    task: TaskSpec,
+    policy: MetaPolicy,
+    gens: int,
+    pop: int,
+    n_univ: int,
+    freeze_eval: bool,
+    library_archive: LibraryArchive,
+    logger: Optional[RunLogger],
+    mode: str,
+    update_archive: bool = True,
+) -> Tuple[List[Dict[str, Any]], Universe]:
+    batch = get_task_batch(task, seed, freeze_eval=freeze_eval)
+    hint = TaskDetective.detect_pattern(batch)
+    descriptor = task.ensure_descriptor()
+    base_lib = FunctionLibrary()
+    for lib in library_archive.select(descriptor):
+        base_lib.merge(lib)
+    universes = [
+        Universe(
+            uid=i,
+            seed=seed + i * 9973,
+            meta=MetaState(),
+            pool=[seed_genome(random.Random(seed + i), hint) for _ in range(pop)],
+            library=FunctionLibrary.from_snapshot(base_lib.snapshot()),
+        )
+        for i in range(n_univ)
+    ]
+    for gen in range(gens):
+        start_ms = now_ms()
+        stats = policy_stats_from_history(universes[0].history)
+        controls = policy.act(descriptor, stats)
+        for u in universes:
+            u.step(gen, task, pop, batch, policy_controls=controls)
+        universes.sort(key=lambda u: u.best_score)
+        best = universes[0]
+        if logger:
+            best_code = best.best.code if best.best else "none"
+            code_hash = sha256(best_code)
+            novelty = 1.0 if code_hash not in logger.seen_hashes else 0.0
+            logger.seen_hashes.add(code_hash)
+            logger.log(
+                gen=gen,
+                task_id=task.name,
+                mode=mode,
+                score_hold=best.best_hold,
+                score_stress=best.best_stress,
+                score_test=best.best_test,
+                runtime_ms=now_ms() - start_ms,
+                nodes=node_count(best_code),
+                code_hash=code_hash,
+                accepted=bool(best.history[-1]["accepted"]) if best.history else False,
+                novelty=novelty,
+                meta_policy_params={"pid": policy.pid, "weights": policy.weights, "bias": policy.bias, "controls": controls},
+                task_descriptor=descriptor.snapshot(),
+            )
+    universes.sort(key=lambda u: u.best_score)
+    best = universes[0]
+    if update_archive:
+        library_archive.add(descriptor, best.best_hold, best.library)
+    return best.history, best
+
+
+def compute_transfer_metrics(history: List[Dict[str, Any]], window: int) -> Dict[str, float]:
+    if not history:
+        return {"auc": float("inf"), "regret": float("inf"), "gap": float("inf"), "recovery_time": float("inf")}
+    holds = [h.get("hold", float("inf")) for h in history[:window]]
+    tests = [h.get("test", float("inf")) for h in history[:window]]
+    auc = sum(holds) / max(1, len(holds))
+    best = min(holds)
+    regret = sum(h - best for h in holds) / max(1, len(holds))
+    gap = (tests[-1] - holds[-1]) if holds and tests else float("inf")
+    threshold = best * 1.1 if math.isfinite(best) else float("inf")
+    recovery_time = float("inf")
+    for i, h in enumerate(holds):
+        if h <= threshold:
+            recovery_time = i + 1
+            break
+    return {"auc": auc, "regret": regret, "gap": gap, "recovery_time": recovery_time}
+
+
+def run_meta_meta(
+    seed: int,
+    episodes: int,
+    gens_per_episode: int,
+    pop: int,
+    n_univ: int,
+    policy_pop: int,
+    freeze_eval: bool,
+    state_dir: Path,
+    eval_every: int,
+    few_shot_gens: int,
+) -> None:
+    rng = random.Random(seed)
+    meta_train, meta_test = split_meta_tasks(seed)
+    n_inputs = len(TaskSpec().ensure_descriptor().vector()) + 4
+    policies = [MetaPolicy.seed(rng, n_outputs=5, n_inputs=n_inputs) for _ in range(policy_pop)]
+    policy_scores = {p.pid: float("inf") for p in policies}
+    archive = LibraryArchive(k=2)
+    logger = RunLogger(state_dir / "run_log.jsonl")
+
+    for episode in range(episodes):
+        task = rng.choice(meta_train)
+        policy = policies[episode % len(policies)]
+        history, best = run_policy_episode(
+            seed + episode * 31,
+            task,
+            policy,
+            gens_per_episode,
+            pop,
+            n_univ,
+            freeze_eval,
+            archive,
+            logger,
+            mode="meta-train",
+            update_archive=True,
+        )
+        metrics = compute_transfer_metrics(history, window=min(few_shot_gens, len(history)))
+        reward = metrics["auc"]
+        policy_scores[policy.pid] = min(policy_scores[policy.pid], reward)
+
+        if (episode + 1) % eval_every == 0:
+            transfer_scores = []
+            for task_test in meta_test:
+                hist, _ = run_policy_episode(
+                    seed + episode * 73,
+                    task_test,
+                    policy,
+                    few_shot_gens,
+                    pop,
+                    n_univ,
+                    freeze_eval,
+                    archive,
+                    logger,
+                    mode="meta-test",
+                    update_archive=False,
+                )
+                transfer_scores.append(compute_transfer_metrics(hist, window=few_shot_gens)["auc"])
+            if transfer_scores:
+                policy_scores[policy.pid] = sum(transfer_scores) / len(transfer_scores)
+            policies.sort(key=lambda p: policy_scores.get(p.pid, float("inf")))
+            best_policy = policies[0]
+            policies = [best_policy] + [best_policy.mutate(rng, scale=0.05) for _ in range(policy_pop - 1)]
+
+
+def run_task_switch(
+    seed: int,
+    task_a: TaskSpec,
+    task_b: TaskSpec,
+    gens_a: int,
+    gens_b: int,
+    pop: int,
+    n_univ: int,
+    freeze_eval: bool,
+    state_dir: Path,
+) -> Dict[str, Any]:
+    rng = random.Random(seed)
+    n_inputs = len(TaskSpec().ensure_descriptor().vector()) + 4
+    transfer_policy = MetaPolicy.seed(rng, n_outputs=5, n_inputs=n_inputs)
+    archive = LibraryArchive(k=2)
+    logger = RunLogger(state_dir / "run_log.jsonl")
+    baseline = MetaPolicy.seed(random.Random(seed + 999), n_outputs=5, n_inputs=n_inputs)
+
+    history_a, _ = run_policy_episode(
+        seed,
+        task_a,
+        transfer_policy,
+        gens_a,
+        pop,
+        n_univ,
+        freeze_eval,
+        archive,
+        logger,
+        mode="switch-train",
+        update_archive=True,
+    )
+    history_transfer, _ = run_policy_episode(
+        seed + 1,
+        task_b,
+        transfer_policy,
+        gens_b,
+        pop,
+        n_univ,
+        freeze_eval,
+        archive,
+        logger,
+        mode="switch-transfer",
+        update_archive=False,
+    )
+    history_baseline, _ = run_policy_episode(
+        seed + 2,
+        task_b,
+        baseline,
+        gens_b,
+        pop,
+        n_univ,
+        freeze_eval,
+        LibraryArchive(k=0),
+        logger,
+        mode="switch-baseline",
+        update_archive=False,
+    )
+    metrics_transfer = compute_transfer_metrics(history_transfer, window=gens_b)
+    metrics_baseline = compute_transfer_metrics(history_baseline, window=gens_b)
+    delta_auc = metrics_baseline["auc"] - metrics_transfer["auc"]
+    delta_recovery = metrics_baseline["recovery_time"] - metrics_transfer["recovery_time"]
+    return {
+        "transfer": metrics_transfer,
+        "baseline": metrics_baseline,
+        "delta_auc": delta_auc,
+        "delta_recovery_time": delta_recovery,
+    }
+
+
+def generate_report(path: Path, few_shot_gens: int) -> Dict[str, Any]:
+    if not path.exists():
+        return {"error": "run_log.jsonl not found"}
+    records = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    by_task: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in records:
+        key = f"{rec['task_id']}::{rec.get('mode', 'unknown')}"
+        by_task.setdefault(key, []).append(rec)
+    report = {"tasks": {}, "few_shot_gens": few_shot_gens}
+    for key, recs in by_task.items():
+        recs.sort(key=lambda r: r["gen"])
+        holds = [r["score_hold"] for r in recs[:few_shot_gens]]
+        tests = [r["score_test"] for r in recs[:few_shot_gens]]
+        auc = sum(holds) / max(1, len(holds))
+        best = min(holds) if holds else float("inf")
+        regret = sum(h - best for h in holds) / max(1, len(holds))
+        gap = (tests[-1] - holds[-1]) if holds and tests else float("inf")
+        threshold = best * 1.1 if math.isfinite(best) else float("inf")
+        recovery_time = float("inf")
+        for i, h in enumerate(holds):
+            if h <= threshold:
+                recovery_time = i + 1
+                break
+        few_shot_delta = (holds[0] - holds[-1]) if len(holds) > 1 else 0.0
+        report["tasks"][key] = {
+            "auc": auc,
+            "regret": regret,
+            "generalization_gap": gap,
+            "recovery_time": recovery_time,
+            "few_shot_delta": few_shot_delta,
+        }
+    return report
 
 
 # ---------------------------
@@ -2296,13 +2986,13 @@ def run_deep_autopatch(levels: List[int], candidates: int = 4, apply: bool = Fal
 
     return {"improved": False, "baseline": baseline, "results": results}
 
-def run_rsi_loop(gens_per_round: int, rounds: int, levels: List[int], pop: int, n_univ: int, mode: str):
+def run_rsi_loop(gens_per_round: int, rounds: int, levels: List[int], pop: int, n_univ: int, mode: str, freeze_eval: bool = True):
     task = TaskSpec()
     seed = int(time.time()) % 100000
     for r in range(rounds):
         print(f"\n{'='*60}\n[RSI ROUND {r+1}/{rounds}]\n{'='*60}")
         print(f"[EVOLVE] {gens_per_round} generations...")
-        run_multiverse(seed, task, gens_per_round, pop, n_univ, resume=(r > 0), mode=mode)
+        run_multiverse(seed, task, gens_per_round, pop, n_univ, resume=(r > 0), mode=mode, freeze_eval=freeze_eval)
         print(f"[AUTOPATCH] Trying L{levels}...")
         result = run_deep_autopatch(levels, candidates=4, apply=True, mode=mode)
         if result.get("applied"):
@@ -2339,7 +3029,17 @@ def cmd_evolve(args):
     global STATE_DIR
     STATE_DIR = Path(args.state_dir)
     resume = bool(args.resume) and (not args.fresh)
-    run_multiverse(args.seed, TaskSpec(name=args.task), args.generations, args.population, args.universes, resume=resume, save_every=args.save_every, mode="solver")
+    run_multiverse(
+        args.seed,
+        TaskSpec(name=args.task),
+        args.generations,
+        args.population,
+        args.universes,
+        resume=resume,
+        save_every=args.save_every,
+        mode="solver",
+        freeze_eval=args.freeze_eval,
+    )
     print(f"\n[OK] State saved to {STATE_DIR / 'state.json'}")
     return 0
 
@@ -2347,7 +3047,17 @@ def cmd_learner_evolve(args):
     global STATE_DIR
     STATE_DIR = Path(args.state_dir)
     resume = bool(args.resume) and (not args.fresh)
-    run_multiverse(args.seed, TaskSpec(name=args.task), args.generations, args.population, args.universes, resume=resume, save_every=args.save_every, mode="learner")
+    run_multiverse(
+        args.seed,
+        TaskSpec(name=args.task),
+        args.generations,
+        args.population,
+        args.universes,
+        resume=resume,
+        save_every=args.save_every,
+        mode="learner",
+        freeze_eval=args.freeze_eval,
+    )
     print(f"\n[OK] State saved to {STATE_DIR / 'state.json'}")
     return 0
 
@@ -2366,7 +3076,7 @@ def cmd_best(args):
         else:
             g = Genome(**best)
         print(g.code)
-    print(f"Score: {u.get('best_score')} | Hold: {u.get('best_hold')} | Stress: {u.get('best_stress')}")
+    print(f"Score: {u.get('best_score')} | Hold: {u.get('best_hold')} | Stress: {u.get('best_stress')} | Test: {u.get('best_test')}")
     print(f"Generations: {gs.generations_done}")
     return 0
 
@@ -2383,7 +3093,48 @@ def cmd_rsi_loop(args):
     global STATE_DIR
     STATE_DIR = Path(args.state_dir)
     levels = [int(l) for l in args.levels.split(",") if l.strip()]
-    run_rsi_loop(args.generations, args.rounds, levels, args.population, args.universes, mode=args.mode)
+    run_rsi_loop(args.generations, args.rounds, levels, args.population, args.universes, mode=args.mode, freeze_eval=args.freeze_eval)
+    return 0
+
+def cmd_meta_meta(args):
+    global STATE_DIR
+    STATE_DIR = Path(args.state_dir)
+    run_meta_meta(
+        seed=args.seed,
+        episodes=args.episodes,
+        gens_per_episode=args.gens_per_episode,
+        pop=args.population,
+        n_univ=args.universes,
+        policy_pop=args.policy_pop,
+        freeze_eval=args.freeze_eval,
+        state_dir=STATE_DIR,
+        eval_every=args.eval_every,
+        few_shot_gens=args.few_shot_gens,
+    )
+    return 0
+
+def cmd_task_switch(args):
+    global STATE_DIR
+    STATE_DIR = Path(args.state_dir)
+    result = run_task_switch(
+        seed=args.seed,
+        task_a=TaskSpec(name=args.task_a),
+        task_b=TaskSpec(name=args.task_b),
+        gens_a=args.gens_a,
+        gens_b=args.gens_b,
+        pop=args.population,
+        n_univ=args.universes,
+        freeze_eval=args.freeze_eval,
+        state_dir=STATE_DIR,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+def cmd_report(args):
+    global STATE_DIR
+    STATE_DIR = Path(args.state_dir)
+    report = generate_report(STATE_DIR / "run_log.jsonl", args.few_shot_gens)
+    print(json.dumps(report, indent=2))
     return 0
 
 def build_parser():
@@ -2403,6 +3154,7 @@ def build_parser():
     e.add_argument("--fresh", action="store_true")
     e.add_argument("--save-every", type=int, default=5)
     e.add_argument("--state-dir", default=".rsi_state")
+    e.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
     e.set_defaults(fn=cmd_evolve)
 
     le = sub.add_parser("learner-evolve")
@@ -2415,6 +3167,7 @@ def build_parser():
     le.add_argument("--fresh", action="store_true")
     le.add_argument("--save-every", type=int, default=5)
     le.add_argument("--state-dir", default=".rsi_state")
+    le.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
     le.set_defaults(fn=cmd_learner_evolve)
 
     b = sub.add_parser("best")
@@ -2437,7 +3190,38 @@ def build_parser():
     r.add_argument("--universes", type=int, default=2)
     r.add_argument("--state-dir", default=".rsi_state")
     r.add_argument("--mode", default="solver", choices=["solver", "learner"])
+    r.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
     r.set_defaults(fn=cmd_rsi_loop)
+
+    mm = sub.add_parser("meta-meta")
+    mm.add_argument("--seed", type=int, default=1337)
+    mm.add_argument("--episodes", type=int, default=20)
+    mm.add_argument("--gens-per-episode", type=int, default=20)
+    mm.add_argument("--population", type=int, default=64)
+    mm.add_argument("--universes", type=int, default=2)
+    mm.add_argument("--policy-pop", type=int, default=4)
+    mm.add_argument("--state-dir", default=".rsi_state")
+    mm.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
+    mm.add_argument("--eval-every", type=int, default=4)
+    mm.add_argument("--few-shot-gens", type=int, default=10)
+    mm.set_defaults(fn=cmd_meta_meta)
+
+    ts = sub.add_parser("task-switch")
+    ts.add_argument("--seed", type=int, default=1337)
+    ts.add_argument("--task-a", default="poly2")
+    ts.add_argument("--task-b", default="piecewise")
+    ts.add_argument("--gens-a", type=int, default=10)
+    ts.add_argument("--gens-b", type=int, default=10)
+    ts.add_argument("--population", type=int, default=64)
+    ts.add_argument("--universes", type=int, default=2)
+    ts.add_argument("--state-dir", default=".rsi_state")
+    ts.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
+    ts.set_defaults(fn=cmd_task_switch)
+
+    rp = sub.add_parser("report")
+    rp.add_argument("--state-dir", default=".rsi_state")
+    rp.add_argument("--few-shot-gens", type=int, default=10)
+    rp.set_defaults(fn=cmd_report)
 
     return p
 
