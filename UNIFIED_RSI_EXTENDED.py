@@ -18,7 +18,6 @@ CLI:
   python UNIFIED_RSI_EXTENDED.py evolve --fresh --generations 50 --mode program
   python UNIFIED_RSI_EXTENDED.py learner-evolve --fresh --generations 100
   python UNIFIED_RSI_EXTENDED.py meta-meta --episodes 20 --gens-per-episode 20
-  python UNIFIED_RSI_EXTENDED.py rsi-loop --generations 20 --rounds 5 --meta-meta
   python UNIFIED_RSI_EXTENDED.py task-switch --task-a poly2 --task-b piecewise
   python UNIFIED_RSI_EXTENDED.py report --state-dir .rsi_state
   python UNIFIED_RSI_EXTENDED.py autopatch --levels 0,1,3 --apply
@@ -112,19 +111,14 @@ class RunLogger:
         gen: int,
         task_id: str,
         mode: str,
-        solver_hash: str,
-        rule_hash: str,
-        score_train: float,
         score_hold: float,
         score_stress: float,
         score_test: float,
         runtime_ms: int,
         nodes: int,
-        depth: int,
+        code_hash: str,
         accepted: bool,
         novelty: float,
-        timeout_rate: float,
-        control_packet: Dict[str, Any],
         meta_policy_params: Dict[str, Any],
         task_descriptor: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -140,9 +134,6 @@ class RunLogger:
             "gen": gen,
             "task_id": task_id,
             "mode": mode,
-            "solver_hash": solver_hash,
-            "rule_hash": rule_hash,
-            "score_train": score_train,
             "score_hold": score_hold,
             "score_stress": score_stress,
             "score_test": score_test,
@@ -150,11 +141,9 @@ class RunLogger:
             "delta_best_window": delta_best_window,
             "runtime_ms": runtime_ms,
             "nodes": nodes,
-            "depth": depth,
+            "hash": code_hash,
             "accepted": accepted,
             "novelty": novelty,
-            "timeout_rate": timeout_rate,
-            "control_packet": control_packet,
             "meta_policy_params": meta_policy_params,
             "task_descriptor": task_descriptor,
         }
@@ -162,18 +151,6 @@ class RunLogger:
             f.write(json.dumps(record) + "\n")
         self.records.append(record)
         return record
-
-
-class RoundLogger:
-    def __init__(self, path: Path, append: bool = False):
-        self.path = path
-        safe_mkdir(self.path.parent)
-        if self.path.exists() and not append:
-            self.path.unlink()
-
-    def log(self, record: Dict[str, Any]) -> None:
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
 
 
 # ---------------------------
@@ -1171,13 +1148,13 @@ def evaluate(
     validator: Callable[[str], Tuple[bool, str]] = validate_code,
 ) -> EvalResult:
     code = g.code
-    ok1, tr, e1 = mse_exec(code, b.x_tr, b.y_tr, task_name, extra_env=extra_env, validator=validator)
-    ok2, ho, e2 = mse_exec(code, b.x_ho, b.y_ho, task_name, extra_env=extra_env, validator=validator)
-    ok3, st, e3 = mse_exec(code, b.x_st, b.y_st, task_name, extra_env=extra_env, validator=validator)
-    ok4, te, e4 = mse_exec(code, b.x_te, b.y_te, task_name, extra_env=extra_env, validator=validator)
+    ok1, tr, e1 = mse_exec(code, b.x_tr, b.y_tr, task_name, extra_env=extra_env)
+    ok2, ho, e2 = mse_exec(code, b.x_ho, b.y_ho, task_name, extra_env=extra_env)
+    ok3, st, e3 = mse_exec(code, b.x_st, b.y_st, task_name, extra_env=extra_env)
+    ok4, te, e4 = mse_exec(code, b.x_te, b.y_te, task_name, extra_env=extra_env)
     ok = ok1 and ok2 and ok3 and ok4 and all(math.isfinite(v) for v in (tr, ho, st, te))
     nodes = node_count(code)
-    score = SCORE_W_HOLD * ho + SCORE_W_STRESS * st + lam * nodes
+    score = SCORE_W_HOLD * ho + SCORE_W_STRESS * st + SCORE_W_TRAIN * tr + lam * nodes
     err = e1 or e2 or e3 or e4
     return EvalResult(ok, tr, ho, st, te, nodes, score, err or None)
 
@@ -1989,146 +1966,64 @@ class MetaCognitiveEngine:
 
 
 # ---------------------------
-# L1 RuleDSL Meta-optimizer
+# L1 Meta-optimizer policy
 # ---------------------------
 
 @dataclass
-class ControlPacket:
-    operator_probs: Dict[str, float]
-    mutation_rate: float
-    mutation_magnitude: float
-    crossover_rate: float
-    branch_insert_rate: float
-    novelty_weight: float
-    acceptance_margin: float
-    patience: int
-    curriculum_bias: float
-
-
-@dataclass
-class RuleDSL:
-    instructions: List[Dict[str, Any]]
-    rid: str = ""
+class MetaPolicy:
+    weights: List[List[float]]
+    bias: List[float]
+    pid: str = ""
 
     @staticmethod
-    def seed(rng: random.Random, n_inputs: int, n_regs: int = 8, steps: int = 12) -> "RuleDSL":
-        ops = ["LOADF", "LOADC", "ADD", "MUL", "TANH", "CLAMP"]
-        instr = []
-        for _ in range(steps):
-            op = rng.choice(ops)
-            instr.append({
-                "op": op,
-                "a": rng.randrange(n_regs),
-                "b": rng.randrange(max(1, n_inputs)),
-                "c": rng.uniform(-1.0, 1.0),
-            })
-        rid = sha256(json.dumps(instr, sort_keys=True))[:12]
-        return RuleDSL(instructions=instr, rid=rid)
+    def seed(rng: random.Random, n_outputs: int, n_inputs: int) -> "MetaPolicy":
+        weights = [[rng.uniform(-0.2, 0.2) for _ in range(n_inputs)] for _ in range(n_outputs)]
+        bias = [rng.uniform(-0.1, 0.1) for _ in range(n_outputs)]
+        pid = sha256(json.dumps(weights) + json.dumps(bias))[:10]
+        return MetaPolicy(weights=weights, bias=bias, pid=pid)
 
-    def snapshot(self) -> Dict[str, Any]:
-        return {"instructions": self.instructions, "rid": self.rid}
+    def _linear(self, features: List[float], idx: int) -> float:
+        w = self.weights[idx]
+        return sum(fi * wi for fi, wi in zip(features, w)) + self.bias[idx]
 
-    @staticmethod
-    def from_snapshot(s: Dict[str, Any]) -> "RuleDSL":
-        return RuleDSL(instructions=list(s.get("instructions", [])), rid=s.get("rid", ""))
-
-    def hash(self) -> str:
-        if not self.rid:
-            self.rid = sha256(json.dumps(self.instructions, sort_keys=True))[:12]
-        return self.rid
-
-    def validate(self, n_inputs: int, n_regs: int = 8, max_steps: int = 32) -> bool:
-        if len(self.instructions) > max_steps:
-            return False
-        allowed = {"LOADF", "LOADC", "ADD", "MUL", "TANH", "CLAMP"}
-        for ins in self.instructions:
-            if ins.get("op") not in allowed:
-                return False
-            a = int(ins.get("a", 0))
-            if a < 0 or a >= n_regs:
-                return False
-            b = int(ins.get("b", 0))
-            if b < 0 or b > max(n_inputs, n_regs):
-                return False
-        return True
-
-    def act(self, descriptor: TaskDescriptor, stats: Dict[str, float]) -> ControlPacket:
+    def act(self, descriptor: TaskDescriptor, stats: Dict[str, float]) -> Dict[str, Any]:
         features = descriptor.vector() + [
             stats.get("delta_best", 0.0),
             stats.get("auc_window", 0.0),
             stats.get("timeout_rate", 0.0),
             stats.get("avg_nodes", 0.0),
-            stats.get("novelty", 0.0),
         ]
-        regs = [0.0 for _ in range(8)]
-        for ins in self.instructions:
-            op = ins.get("op")
-            a = int(ins.get("a", 0))
-            b = int(ins.get("b", 0))
-            c = float(ins.get("c", 0.0))
-            if op == "LOADF":
-                regs[a] = features[b % len(features)]
-            elif op == "LOADC":
-                regs[a] = c
-            elif op == "ADD":
-                regs[a] = regs[a] + regs[b % len(regs)]
-            elif op == "MUL":
-                regs[a] = regs[a] * regs[b % len(regs)]
-            elif op == "TANH":
-                regs[a] = math.tanh(regs[a])
-            elif op == "CLAMP":
-                regs[a] = clamp(regs[a], -1.0, 1.0)
-        mutation_rate = clamp(0.4 + regs[0], 0.05, 0.98)
-        mutation_magnitude = clamp(0.2 + abs(regs[1]), 0.05, 1.0)
-        crossover_rate = clamp(0.2 + regs[2], 0.0, 0.9)
-        branch_insert_rate = clamp(0.1 + abs(regs[3]), 0.0, 0.6)
-        novelty_weight = clamp(0.2 + regs[4], 0.0, 1.0)
-        acceptance_margin = clamp(abs(regs[5]) * 0.01, 0.0, 0.05)
-        patience = int(clamp(abs(regs[6]) * 10.0, 1.0, 20.0))
-        curriculum_bias = clamp(regs[7], -1.0, 1.0)
-        operator_probs = {op: clamp(OP_WEIGHT_INIT.get(op, 1.0) * (1.0 + regs[2]), 0.1, 8.0) for op in OPERATORS}
-        return ControlPacket(
-            operator_probs=operator_probs,
-            mutation_rate=mutation_rate,
-            mutation_magnitude=mutation_magnitude,
-            crossover_rate=crossover_rate,
-            branch_insert_rate=branch_insert_rate,
-            novelty_weight=novelty_weight,
-            acceptance_margin=acceptance_margin,
-            patience=patience,
-            curriculum_bias=curriculum_bias,
-        )
+        outputs = [self._linear(features, i) for i in range(len(self.weights))]
+        mutation_rate = clamp(0.5 + outputs[0], 0.05, 0.98)
+        crossover_rate = clamp(0.2 + outputs[1], 0.0, 0.9)
+        novelty_weight = clamp(0.2 + outputs[2], 0.0, 1.0)
+        branch_insert_rate = clamp(0.1 + outputs[3], 0.0, 0.6)
+        op_scale = clamp(1.0 + outputs[4], 0.2, 3.0)
+        op_weights = {
+            "modify_return": clamp(OP_WEIGHT_INIT.get("modify_return", 1.0) * op_scale, 0.1, 8.0),
+            "insert_assign": clamp(OP_WEIGHT_INIT.get("insert_assign", 1.0) * (op_scale + 0.2), 0.1, 8.0),
+            "list_manip": clamp(OP_WEIGHT_INIT.get("list_manip", 1.0) * (op_scale - 0.1), 0.1, 8.0),
+        }
+        return {
+            "mutation_rate": mutation_rate,
+            "crossover_rate": crossover_rate,
+            "novelty_weight": novelty_weight,
+            "branch_insert_rate": branch_insert_rate,
+            "op_weights": op_weights,
+        }
 
-
-class RulePatcher:
-    @staticmethod
-    def propose(rng: random.Random, rule: RuleDSL, n_inputs: int) -> RuleDSL:
-        instr = [dict(i) for i in rule.instructions]
-        if not instr:
-            return RuleDSL.seed(rng, n_inputs)
-        choice = rng.random()
-        if choice < 0.4 and instr:
-            idx = rng.randrange(len(instr))
-            instr[idx]["c"] = float(instr[idx].get("c", 0.0)) + rng.uniform(-0.5, 0.5)
-        elif choice < 0.7 and instr:
-            idx = rng.randrange(len(instr))
-            instr[idx]["op"] = rng.choice(["LOADF", "LOADC", "ADD", "MUL", "TANH", "CLAMP"])
-        else:
-            instr.append({
-                "op": rng.choice(["LOADF", "LOADC", "ADD", "MUL", "TANH", "CLAMP"]),
-                "a": rng.randrange(8),
-                "b": rng.randrange(max(1, n_inputs)),
-                "c": rng.uniform(-1.0, 1.0),
-            })
-        patched = RuleDSL(instr)
-        patched.hash()
-        return patched
-
-
-def rule_is_deterministic(rule: RuleDSL, descriptor: TaskDescriptor, stats: Dict[str, float]) -> bool:
-    a = asdict(rule.act(descriptor, stats))
-    b = asdict(rule.act(descriptor, stats))
-    return a == b
+    def mutate(self, rng: random.Random, scale: float = 0.1) -> "MetaPolicy":
+        weights = [row[:] for row in self.weights]
+        bias = self.bias[:]
+        for i in range(len(weights)):
+            if rng.random() < 0.7:
+                j = rng.randrange(len(weights[i]))
+                weights[i][j] += rng.uniform(-scale, scale)
+        for i in range(len(bias)):
+            if rng.random() < 0.5:
+                bias[i] += rng.uniform(-scale, scale)
+        pid = sha256(json.dumps(weights) + json.dumps(bias))[:10]
+        return MetaPolicy(weights=weights, bias=bias, pid=pid)
 
 
 # ---------------------------
@@ -2152,22 +2047,14 @@ class Universe:
     best_test: float = float("inf")
     history: List[Dict] = field(default_factory=list)
 
-    def step(self, gen: int, task: TaskSpec, pop_size: int, batch: Batch, policy_controls: Optional[Any] = None) -> Dict:
+    def step(self, gen: int, task: TaskSpec, pop_size: int, batch: Batch, policy_controls: Optional[Dict[str, float]] = None) -> Dict:
         rng = random.Random(self.seed + gen * 1009)
         if batch is None:
             self.pool = [seed_genome(rng) for _ in range(pop_size)]
             return {"gen": gen, "accepted": False, "reason": "no_batch"}
 
         helper_env = self.library.get_helpers()
-        if isinstance(policy_controls, ControlPacket):
-            self.meta.mutation_rate = clamp(policy_controls.mutation_rate * policy_controls.mutation_magnitude, 0.05, 0.98)
-            self.meta.crossover_rate = clamp(policy_controls.crossover_rate, 0.0, 0.95)
-            novelty_weight = clamp(policy_controls.novelty_weight, 0.0, 1.0)
-            branch_rate = clamp(policy_controls.branch_insert_rate, 0.0, 0.6)
-            for k, v in policy_controls.operator_probs.items():
-                if k in self.meta.op_weights:
-                    self.meta.op_weights[k] = clamp(float(v), 0.1, 8.0)
-        elif policy_controls:
+        if policy_controls:
             self.meta.mutation_rate = clamp(policy_controls.get("mutation_rate", self.meta.mutation_rate), 0.05, 0.98)
             self.meta.crossover_rate = clamp(policy_controls.get("crossover_rate", self.meta.crossover_rate), 0.0, 0.95)
             novelty_weight = clamp(policy_controls.get("novelty_weight", 0.0), 0.0, 1.0)
@@ -2642,27 +2529,22 @@ def run_multiverse(
         best = us[0]
         runtime_ms = now_ms() - start_ms
         best_code = best.best.code if best.best else "none"
-        solver_hash = sha256(best_code)
-        novelty = 1.0 if solver_hash not in logger.seen_hashes else 0.0
-        logger.seen_hashes.add(solver_hash)
+        code_hash = sha256(best_code)
+        novelty = 1.0 if code_hash not in logger.seen_hashes else 0.0
+        logger.seen_hashes.add(code_hash)
         accepted = bool(best.history[-1]["accepted"]) if best.history else False
         logger.log(
             gen=gen,
             task_id=task.name,
             mode=mode,
-            solver_hash=solver_hash,
-            rule_hash="baseline",
-            score_train=getattr(best, "best_train", float("inf")),
             score_hold=best.best_hold,
             score_stress=best.best_stress,
             score_test=getattr(best, "best_test", float("inf")),
             runtime_ms=runtime_ms,
             nodes=node_count(best_code),
-            depth=ast_depth(best_code),
+            code_hash=code_hash,
             accepted=accepted,
             novelty=novelty,
-            timeout_rate=best.history[-1].get("timeout_rate", 0.0) if best.history else 0.0,
-            control_packet={},
             meta_policy_params={},
             task_descriptor=task.descriptor.snapshot() if task.descriptor else None,
         )
@@ -2702,7 +2584,7 @@ def run_multiverse(
 
 def policy_stats_from_history(history: List[Dict[str, Any]], window: int = 5) -> Dict[str, float]:
     if not history:
-        return {"delta_best": 0.0, "auc_window": 0.0, "timeout_rate": 0.0, "avg_nodes": 0.0, "novelty": 0.0}
+        return {"delta_best": 0.0, "auc_window": 0.0, "timeout_rate": 0.0, "avg_nodes": 0.0}
     holds = [h.get("hold", 0.0) for h in history]
     recent = holds[-window:] if len(holds) >= window else holds
     auc_window = sum(recent) / max(1, len(recent))
@@ -2717,14 +2599,13 @@ def policy_stats_from_history(history: List[Dict[str, Any]], window: int = 5) ->
         "auc_window": auc_window,
         "timeout_rate": timeout_rate,
         "avg_nodes": avg_nodes,
-        "novelty": history[-1].get("novelty_weight", 0.0),
     }
 
 
-def run_rule_episode(
+def run_policy_episode(
     seed: int,
     task: TaskSpec,
-    rule: RuleDSL,
+    policy: MetaPolicy,
     gens: int,
     pop: int,
     n_univ: int,
@@ -2733,7 +2614,6 @@ def run_rule_episode(
     logger: Optional[RunLogger],
     mode: str,
     update_archive: bool = True,
-    eval_mode: str = "solver",
 ) -> Tuple[List[Dict[str, Any]], Universe]:
     batch = get_task_batch(task, seed, freeze_eval=freeze_eval)
     hint = TaskDetective.detect_pattern(batch)
@@ -2748,41 +2628,35 @@ def run_rule_episode(
             meta=MetaState(),
             pool=[seed_genome(random.Random(seed + i), hint) for _ in range(pop)],
             library=FunctionLibrary.from_snapshot(base_lib.snapshot()),
-            eval_mode=eval_mode,
         )
         for i in range(n_univ)
     ]
     for gen in range(gens):
         start_ms = now_ms()
         stats = policy_stats_from_history(universes[0].history)
-        controls = rule.act(descriptor, stats)
+        controls = policy.act(descriptor, stats)
         for u in universes:
             u.step(gen, task, pop, batch, policy_controls=controls)
         universes.sort(key=lambda u: u.best_score)
         best = universes[0]
         if logger:
             best_code = best.best.code if best.best else "none"
-            solver_hash = sha256(best_code)
-            novelty = 1.0 if solver_hash not in logger.seen_hashes else 0.0
-            logger.seen_hashes.add(solver_hash)
+            code_hash = sha256(best_code)
+            novelty = 1.0 if code_hash not in logger.seen_hashes else 0.0
+            logger.seen_hashes.add(code_hash)
             logger.log(
                 gen=gen,
                 task_id=task.name,
                 mode=mode,
-                solver_hash=solver_hash,
-                rule_hash=rule.hash(),
-                score_train=best.best_train,
                 score_hold=best.best_hold,
                 score_stress=best.best_stress,
                 score_test=best.best_test,
                 runtime_ms=now_ms() - start_ms,
                 nodes=node_count(best_code),
-                depth=ast_depth(best_code),
+                code_hash=code_hash,
                 accepted=bool(best.history[-1]["accepted"]) if best.history else False,
                 novelty=novelty,
-                timeout_rate=best.history[-1].get("timeout_rate", 0.0) if best.history else 0.0,
-                control_packet=asdict(controls),
-                meta_policy_params={"rule_dsl": rule.snapshot()},
+                meta_policy_params={"pid": policy.pid, "weights": policy.weights, "bias": policy.bias, "controls": controls},
                 task_descriptor=descriptor.snapshot(),
             )
     universes.sort(key=lambda u: u.best_score)
@@ -2796,16 +2670,14 @@ def compute_transfer_metrics(history: List[Dict[str, Any]], window: int) -> Dict
     if not history:
         return {"auc": float("inf"), "regret": float("inf"), "gap": float("inf"), "recovery_time": float("inf")}
     holds = [h.get("hold", float("inf")) for h in history[:window]]
-    stress = [h.get("stress", float("inf")) for h in history[:window]]
-    combined = [SCORE_W_HOLD * h + SCORE_W_STRESS * s for h, s in zip(holds, stress)]
     tests = [h.get("test", float("inf")) for h in history[:window]]
-    auc = sum(combined) / max(1, len(combined))
-    best = min(combined)
-    regret = sum(h - best for h in combined) / max(1, len(combined))
-    gap = (tests[-1] - combined[-1]) if combined and tests else float("inf")
+    auc = sum(holds) / max(1, len(holds))
+    best = min(holds)
+    regret = sum(h - best for h in holds) / max(1, len(holds))
+    gap = (tests[-1] - holds[-1]) if holds and tests else float("inf")
     threshold = best * 1.1 if math.isfinite(best) else float("inf")
     recovery_time = float("inf")
-    for i, h in enumerate(combined):
+    for i, h in enumerate(holds):
         if h <= threshold:
             recovery_time = i + 1
             break
@@ -2818,6 +2690,7 @@ def run_meta_meta(
     gens_per_episode: int,
     pop: int,
     n_univ: int,
+    policy_pop: int,
     freeze_eval: bool,
     state_dir: Path,
     eval_every: int,
@@ -2825,119 +2698,54 @@ def run_meta_meta(
 ) -> None:
     rng = random.Random(seed)
     meta_train, meta_test = split_meta_tasks(seed)
-    n_inputs = len(TaskSpec().ensure_descriptor().vector()) + 5
-    current_rule = RuleDSL.seed(rng, n_inputs=n_inputs)
+    n_inputs = len(TaskSpec().ensure_descriptor().vector()) + 4
+    policies = [MetaPolicy.seed(rng, n_outputs=5, n_inputs=n_inputs) for _ in range(policy_pop)]
+    policy_scores = {p.pid: float("inf") for p in policies}
     archive = LibraryArchive(k=2)
     logger = RunLogger(state_dir / "run_log.jsonl")
-    round_logger = RoundLogger(state_dir / "rsi_round_log.jsonl")
 
     for episode in range(episodes):
-        neutral_stats = {"delta_best": 0.0, "auc_window": 0.0, "timeout_rate": 0.0, "avg_nodes": 0.0, "novelty": 0.0}
-        weights = []
-        for t in meta_train:
-            control = current_rule.act(t.ensure_descriptor(), neutral_stats)
-            weights.append(max(0.1, 1.0 + control.curriculum_bias))
-        task_batch = []
-        for _ in range(min(2, len(meta_train))):
-            pick = rng.random() * sum(weights)
-            acc = 0.0
-            for t, w in zip(meta_train, weights):
-                acc += w
-                if pick <= acc:
-                    task_batch.append(t)
-                    break
-        meta_train_scores = []
-        for task in task_batch:
-            history, _ = run_rule_episode(
-                seed + episode * 31,
-                task,
-                current_rule,
-                gens_per_episode,
-                pop,
-                n_univ,
-                freeze_eval,
-                archive,
-                logger,
-                mode="meta-train",
-                update_archive=True,
-            )
-            meta_train_scores.append(compute_transfer_metrics(history, window=min(few_shot_gens, len(history)))["auc"])
-        meta_train_reward = sum(meta_train_scores) / max(1, len(meta_train_scores))
+        task = rng.choice(meta_train)
+        policy = policies[episode % len(policies)]
+        history, best = run_policy_episode(
+            seed + episode * 31,
+            task,
+            policy,
+            gens_per_episode,
+            pop,
+            n_univ,
+            freeze_eval,
+            archive,
+            logger,
+            mode="meta-train",
+            update_archive=True,
+        )
+        metrics = compute_transfer_metrics(history, window=min(few_shot_gens, len(history)))
+        reward = metrics["auc"]
+        policy_scores[policy.pid] = min(policy_scores[policy.pid], reward)
 
-        meta_test_transfer_score = float("inf")
-        avg_regret = float("inf")
-        avg_recovery = float("inf")
-        avg_gap = float("inf")
-        rule_hash_before = current_rule.hash()
-        patch_proposed = (episode + 1) % eval_every == 0
-        valid_patch = False
-        accept = False
-        if patch_proposed:
-            patched_rule = RulePatcher.propose(rng, current_rule, n_inputs=n_inputs)
-            valid_patch = patched_rule.validate(n_inputs=n_inputs)
-            deterministic = rule_is_deterministic(
-                patched_rule,
-                TaskSpec().ensure_descriptor(),
-                {"delta_best": 0.0, "auc_window": 0.0, "timeout_rate": 0.0, "avg_nodes": 0.0, "novelty": 0.0},
-            )
-            valid_patch = valid_patch and deterministic
-            meta_test_scores = []
-            meta_test_metrics = []
-            if valid_patch:
-                for task_test in meta_test:
-                    hist, _ = run_rule_episode(
-                        seed + episode * 73,
-                        task_test,
-                        patched_rule,
-                        few_shot_gens,
-                        pop,
-                        n_univ,
-                        freeze_eval,
-                        archive,
-                        logger,
-                        mode="meta-test",
-                        update_archive=False,
-                    )
-                    metrics = compute_transfer_metrics(hist, window=few_shot_gens)
-                    meta_test_scores.append(metrics["auc"])
-                    meta_test_metrics.append(metrics)
-            meta_test_transfer_score = sum(meta_test_scores) / max(1, len(meta_test_scores)) if meta_test_scores else float("inf")
-            accept = valid_patch and (meta_test_transfer_score < meta_train_reward - 1e-6)
-            if accept:
-                current_rule = patched_rule
-            avg_regret = sum(m["regret"] for m in meta_test_metrics) / max(1, len(meta_test_metrics)) if meta_test_metrics else float("inf")
-            avg_recovery = sum(m["recovery_time"] for m in meta_test_metrics) / max(1, len(meta_test_metrics)) if meta_test_metrics else float("inf")
-            avg_gap = sum(m["gap"] for m in meta_test_metrics) / max(1, len(meta_test_metrics)) if meta_test_metrics else float("inf")
-
-        round_logger.log({
-            "round": episode,
-            "meta_train_reward": meta_train_reward,
-            "meta_test_transfer_score": meta_test_transfer_score,
-            "AUC_N": meta_test_transfer_score,
-            "regret": avg_regret,
-            "recovery_time": avg_recovery,
-            "generalization_gap": avg_gap,
-            "rule_patch_proposed": patch_proposed,
-            "rule_patch_applied": valid_patch,
-            "rule_patch_accepted": accept,
-            "rule_patch_rolled_back": bool(valid_patch and not accept),
-            "rule_hash_before": rule_hash_before,
-            "rule_hash_after": current_rule.hash(),
-        })
-
-    final_state = GlobalState(
-        version="RSI_EXTENDED_meta_meta",
-        created_ms=now_ms(),
-        updated_ms=now_ms(),
-        base_seed=seed,
-        task={"meta_train": [asdict(t) for t in meta_train], "meta_test": [asdict(t) for t in meta_test]},
-        universes=[],
-        selected_uid=0,
-        generations_done=episodes,
-        mode="meta-meta",
-        rule_dsl=current_rule.snapshot(),
-    )
-    write_json(state_dir / "state.json", asdict(final_state))
+        if (episode + 1) % eval_every == 0:
+            transfer_scores = []
+            for task_test in meta_test:
+                hist, _ = run_policy_episode(
+                    seed + episode * 73,
+                    task_test,
+                    policy,
+                    few_shot_gens,
+                    pop,
+                    n_univ,
+                    freeze_eval,
+                    archive,
+                    logger,
+                    mode="meta-test",
+                    update_archive=False,
+                )
+                transfer_scores.append(compute_transfer_metrics(hist, window=few_shot_gens)["auc"])
+            if transfer_scores:
+                policy_scores[policy.pid] = sum(transfer_scores) / len(transfer_scores)
+            policies.sort(key=lambda p: policy_scores.get(p.pid, float("inf")))
+            best_policy = policies[0]
+            policies = [best_policy] + [best_policy.mutate(rng, scale=0.05) for _ in range(policy_pop - 1)]
 
 
 def run_task_switch(
@@ -2952,16 +2760,16 @@ def run_task_switch(
     state_dir: Path,
 ) -> Dict[str, Any]:
     rng = random.Random(seed)
-    n_inputs = len(TaskSpec().ensure_descriptor().vector()) + 5
-    transfer_rule = RuleDSL.seed(rng, n_inputs=n_inputs)
+    n_inputs = len(TaskSpec().ensure_descriptor().vector()) + 4
+    transfer_policy = MetaPolicy.seed(rng, n_outputs=5, n_inputs=n_inputs)
     archive = LibraryArchive(k=2)
     logger = RunLogger(state_dir / "run_log.jsonl")
-    baseline = RuleDSL.seed(random.Random(seed + 999), n_inputs=n_inputs)
+    baseline = MetaPolicy.seed(random.Random(seed + 999), n_outputs=5, n_inputs=n_inputs)
 
-    history_a, _ = run_rule_episode(
+    history_a, _ = run_policy_episode(
         seed,
         task_a,
-        transfer_rule,
+        transfer_policy,
         gens_a,
         pop,
         n_univ,
@@ -2971,10 +2779,10 @@ def run_task_switch(
         mode="switch-train",
         update_archive=True,
     )
-    history_transfer, _ = run_rule_episode(
+    history_transfer, _ = run_policy_episode(
         seed + 1,
         task_b,
-        transfer_rule,
+        transfer_policy,
         gens_b,
         pop,
         n_univ,
@@ -2984,7 +2792,7 @@ def run_task_switch(
         mode="switch-transfer",
         update_archive=False,
     )
-    history_baseline, _ = run_rule_episode(
+    history_baseline, _ = run_policy_episode(
         seed + 2,
         task_b,
         baseline,
@@ -3026,20 +2834,18 @@ def generate_report(path: Path, few_shot_gens: int) -> Dict[str, Any]:
     for key, recs in by_task.items():
         recs.sort(key=lambda r: r["gen"])
         holds = [r["score_hold"] for r in recs[:few_shot_gens]]
-        stress = [r["score_stress"] for r in recs[:few_shot_gens]]
-        combined = [SCORE_W_HOLD * h + SCORE_W_STRESS * s for h, s in zip(holds, stress)]
         tests = [r["score_test"] for r in recs[:few_shot_gens]]
-        auc = sum(combined) / max(1, len(combined))
-        best = min(combined) if combined else float("inf")
-        regret = sum(h - best for h in combined) / max(1, len(combined))
-        gap = (tests[-1] - combined[-1]) if combined and tests else float("inf")
+        auc = sum(holds) / max(1, len(holds))
+        best = min(holds) if holds else float("inf")
+        regret = sum(h - best for h in holds) / max(1, len(holds))
+        gap = (tests[-1] - holds[-1]) if holds and tests else float("inf")
         threshold = best * 1.1 if math.isfinite(best) else float("inf")
         recovery_time = float("inf")
-        for i, h in enumerate(combined):
+        for i, h in enumerate(holds):
             if h <= threshold:
                 recovery_time = i + 1
                 break
-        few_shot_delta = (combined[0] - combined[-1]) if len(combined) > 1 else 0.0
+        few_shot_delta = (holds[0] - holds[-1]) if len(holds) > 1 else 0.0
         report["tasks"][key] = {
             "auc": auc,
             "regret": regret,
@@ -3314,16 +3120,7 @@ def run_deep_autopatch(levels: List[int], candidates: int = 4, apply: bool = Fal
 
     return {"improved": False, "baseline": baseline, "results": results}
 
-def run_rsi_loop(
-    gens_per_round: int,
-    rounds: int,
-    levels: List[int],
-    pop: int,
-    n_univ: int,
-    mode: str,
-    freeze_eval: bool = True,
-    meta_meta: bool = False,
-):
+def run_rsi_loop(gens_per_round: int, rounds: int, levels: List[int], pop: int, n_univ: int, mode: str, freeze_eval: bool = True):
     task = TaskSpec()
     seed = int(time.time()) % 100000
     if meta_meta:
@@ -3389,7 +3186,7 @@ def cmd_evolve(args):
         args.universes,
         resume=resume,
         save_every=args.save_every,
-        mode=args.mode,
+        mode="solver",
         freeze_eval=args.freeze_eval,
     )
     print(f"\n[OK] State saved to {STATE_DIR / 'state.json'}")
@@ -3445,16 +3242,7 @@ def cmd_rsi_loop(args):
     global STATE_DIR
     STATE_DIR = Path(args.state_dir)
     levels = [int(l) for l in args.levels.split(",") if l.strip()]
-    run_rsi_loop(
-        args.generations,
-        args.rounds,
-        levels,
-        args.population,
-        args.universes,
-        mode=args.mode,
-        freeze_eval=args.freeze_eval,
-        meta_meta=args.meta_meta,
-    )
+    run_rsi_loop(args.generations, args.rounds, levels, args.population, args.universes, mode=args.mode, freeze_eval=args.freeze_eval)
     return 0
 
 def cmd_meta_meta(args):
@@ -3466,6 +3254,7 @@ def cmd_meta_meta(args):
         gens_per_episode=args.gens_per_episode,
         pop=args.population,
         n_univ=args.universes,
+        policy_pop=args.policy_pop,
         freeze_eval=args.freeze_eval,
         state_dir=STATE_DIR,
         eval_every=args.eval_every,
@@ -3515,7 +3304,6 @@ def build_parser():
     e.add_argument("--save-every", type=int, default=5)
     e.add_argument("--state-dir", default=".rsi_state")
     e.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
-    e.add_argument("--mode", default="solver", choices=["solver", "program"])
     e.set_defaults(fn=cmd_evolve)
 
     le = sub.add_parser("learner-evolve")
@@ -3550,9 +3338,8 @@ def build_parser():
     r.add_argument("--population", type=int, default=64)
     r.add_argument("--universes", type=int, default=2)
     r.add_argument("--state-dir", default=".rsi_state")
-    r.add_argument("--mode", default="solver", choices=["solver", "learner", "program"])
+    r.add_argument("--mode", default="solver", choices=["solver", "learner"])
     r.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
-    r.add_argument("--meta-meta", action="store_true")
     r.set_defaults(fn=cmd_rsi_loop)
 
     mm = sub.add_parser("meta-meta")
@@ -3561,6 +3348,7 @@ def build_parser():
     mm.add_argument("--gens-per-episode", type=int, default=20)
     mm.add_argument("--population", type=int, default=64)
     mm.add_argument("--universes", type=int, default=2)
+    mm.add_argument("--policy-pop", type=int, default=4)
     mm.add_argument("--state-dir", default=".rsi_state")
     mm.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
     mm.add_argument("--eval-every", type=int, default=4)
