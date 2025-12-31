@@ -3,13 +3,13 @@ import ast
 import copy
 import json
 import math
+import pprint
 import random
 import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-import pprint
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 META_DIR = Path(".rsi_meta")
 RUNS_DIR = META_DIR / "runs"
@@ -32,6 +32,7 @@ class SelfModPolicy:
     stability_window: int = 3
     overfit_penalty: float = 0.05
     acceptance_patience: int = 2
+    arch_switch_threshold: float = 0.95
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -39,6 +40,7 @@ class SelfModPolicy:
             "stability_window": self.stability_window,
             "overfit_penalty": self.overfit_penalty,
             "acceptance_patience": self.acceptance_patience,
+            "arch_switch_threshold": self.arch_switch_threshold,
         }
 
     @staticmethod
@@ -48,6 +50,7 @@ class SelfModPolicy:
             stability_window=data.get("stability_window", 3),
             overfit_penalty=data.get("overfit_penalty", 0.05),
             acceptance_patience=data.get("acceptance_patience", 2),
+            arch_switch_threshold=data.get("arch_switch_threshold", 0.95),
         )
 
 
@@ -62,6 +65,7 @@ class MetaConfig:
     max_program_length: int
     max_depth: int
     registers: int
+    stack_size: int
     complexity_weight: float
     runtime_weight: float
     architecture_mode: str
@@ -77,6 +81,7 @@ class MetaConfig:
             "max_program_length": self.max_program_length,
             "max_depth": self.max_depth,
             "registers": self.registers,
+            "stack_size": self.stack_size,
             "complexity_weight": self.complexity_weight,
             "runtime_weight": self.runtime_weight,
             "architecture_mode": self.architecture_mode,
@@ -87,16 +92,17 @@ class MetaConfig:
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "MetaConfig":
         return MetaConfig(
-            population_size=int(data.get("population_size", 40)),
-            generations=int(data.get("generations", 12)),
-            mutation_rate=float(data.get("mutation_rate", 0.2)),
+            population_size=int(data.get("population_size", 36)),
+            generations=int(data.get("generations", 10)),
+            mutation_rate=float(data.get("mutation_rate", 0.25)),
             crossover_rate=float(data.get("crossover_rate", 0.4)),
-            max_program_length=int(data.get("max_program_length", 14)),
+            max_program_length=int(data.get("max_program_length", 12)),
             max_depth=int(data.get("max_depth", 4)),
             registers=int(data.get("registers", 4)),
+            stack_size=int(data.get("stack_size", 6)),
             complexity_weight=float(data.get("complexity_weight", 0.01)),
             runtime_weight=float(data.get("runtime_weight", 0.001)),
-            architecture_mode=data.get("architecture_mode", "linear_gp"),
+            architecture_mode=data.get("architecture_mode", "stack_gp"),
             dsl_operators=list(data.get("dsl_operators", [])),
             self_mod_policy=SelfModPolicy.from_dict(data.get("self_mod_policy", {})),
         )
@@ -104,22 +110,24 @@ class MetaConfig:
 
 # @@METACONFIG_START@@
 DEFAULT_META_CONFIG = {
-    "population_size": 40,
-    "generations": 12,
-    "mutation_rate": 0.2,
+    "population_size": 36,
+    "generations": 10,
+    "mutation_rate": 0.25,
     "crossover_rate": 0.4,
-    "max_program_length": 14,
+    "max_program_length": 12,
     "max_depth": 4,
     "registers": 4,
+    "stack_size": 6,
     "complexity_weight": 0.01,
     "runtime_weight": 0.001,
-    "architecture_mode": "linear_gp",
-    "dsl_operators": ["add", "sub", "mul", "neg", "abs", "square", "sin", "cos"],
+    "architecture_mode": "stack_gp",
+    "dsl_operators": ["add", "sub", "mul", "neg", "abs", "square", "sin", "cos", "min", "max"],
     "self_mod_policy": {
         "min_improvement_ratio": 0.98,
         "stability_window": 3,
         "overfit_penalty": 0.05,
         "acceptance_patience": 2,
+        "arch_switch_threshold": 0.95,
     },
 }
 # @@METACONFIG_END@@
@@ -135,6 +143,8 @@ DSL_OPERATORS = {
     "square": {"arity": 1, "kind": "base"},
     "sin": {"arity": 1, "kind": "base"},
     "cos": {"arity": 1, "kind": "base"},
+    "min": {"arity": 2, "kind": "base"},
+    "max": {"arity": 2, "kind": "base"},
 }
 # @@DSL_REGISTRY_END@@
 
@@ -192,6 +202,10 @@ def base_operator_impl(name: str, args: Sequence[float]) -> float:
         return math.sin(args[0])
     if name == "cos":
         return math.cos(args[0])
+    if name == "min":
+        return min(args[0], args[1])
+    if name == "max":
+        return max(args[0], args[1])
     raise ValueError(f"Unknown base operator {name}")
 
 
@@ -345,6 +359,71 @@ class TreeProgram:
         return TreeProgram(new_root)
 
 
+@dataclass
+class StackInstruction:
+    """Stack-based GP instruction."""
+
+    op: str
+
+
+@dataclass
+class StackProgram:
+    """Stack GP program representation."""
+
+    instructions: List[StackInstruction]
+    stack_size: int
+
+    def execute_scalar(self, inputs: Sequence[float], registry: Dict[str, Dict[str, Any]]) -> float:
+        stack = list(inputs[: self.stack_size])
+        stack = [float(v) for v in stack]
+        for instr in self.instructions:
+            if instr.op not in registry:
+                continue
+            meta = registry[instr.op]
+            arity = meta.get("arity", 1)
+            if len(stack) < arity:
+                stack.append(0.0)
+            if arity == 1:
+                arg = stack.pop() if stack else 0.0
+                stack.append(apply_operator(instr.op, [arg], registry))
+            else:
+                b = stack.pop() if stack else 0.0
+                a = stack.pop() if stack else 0.0
+                stack.append(apply_operator(instr.op, [a, b], registry))
+            if len(stack) > self.stack_size:
+                stack = stack[-self.stack_size :]
+        return stack[-1] if stack else 0.0
+
+    def execute(self, input_value: Any, registry: Dict[str, Dict[str, Any]]) -> Any:
+        if isinstance(input_value, list):
+            return [self.execute_scalar([v], registry) for v in input_value]
+        if isinstance(input_value, tuple):
+            return self.execute_scalar(list(input_value), registry)
+        return self.execute_scalar([input_value], registry)
+
+    def complexity(self) -> int:
+        return len(self.instructions)
+
+    def mutate(self, meta_config: MetaConfig, registry: Dict[str, Dict[str, Any]], rng: random.Random) -> "StackProgram":
+        new_instructions = copy.deepcopy(self.instructions)
+        if not new_instructions or rng.random() < 0.5:
+            new_instructions.append(random_stack_instruction(meta_config, rng))
+        else:
+            idx = rng.randrange(len(new_instructions))
+            new_instructions[idx] = random_stack_instruction(meta_config, rng)
+        if len(new_instructions) > meta_config.max_program_length:
+            new_instructions = new_instructions[: meta_config.max_program_length]
+        return StackProgram(new_instructions, self.stack_size)
+
+    def crossover(self, other: "StackProgram", rng: random.Random) -> "StackProgram":
+        if not self.instructions or not other.instructions:
+            return copy.deepcopy(self)
+        cut_a = rng.randrange(len(self.instructions))
+        cut_b = rng.randrange(len(other.instructions))
+        child_instr = self.instructions[:cut_a] + other.instructions[cut_b:]
+        return StackProgram(child_instr, self.stack_size)
+
+
 def collect_nodes(node: TreeNode) -> List[TreeNode]:
     nodes = [node]
     for child in node.children:
@@ -374,14 +453,25 @@ def random_instruction(meta_config: MetaConfig, registry: Dict[str, Dict[str, An
     return Instruction(op=op, dest=dest, src_a=src_a, src_b=src_b)
 
 
+def random_stack_instruction(meta_config: MetaConfig, rng: random.Random) -> StackInstruction:
+    op = rng.choice(meta_config.dsl_operators)
+    return StackInstruction(op=op)
+
+
 def random_program(meta_config: MetaConfig, registry: Dict[str, Dict[str, Any]], rng: random.Random) -> Any:
     if meta_config.architecture_mode == "tree_gp":
         return TreeProgram(random_tree_node(meta_config, registry, rng, depth=0))
+    if meta_config.architecture_mode == "linear_gp":
+        instructions = [
+            random_instruction(meta_config, registry, rng)
+            for _ in range(rng.randint(1, meta_config.max_program_length))
+        ]
+        return LinearProgram(instructions=instructions, registers=meta_config.registers)
     instructions = [
-        random_instruction(meta_config, registry, rng)
+        random_stack_instruction(meta_config, rng)
         for _ in range(rng.randint(1, meta_config.max_program_length))
     ]
-    return LinearProgram(instructions=instructions, registers=meta_config.registers)
+    return StackProgram(instructions=instructions, stack_size=meta_config.stack_size)
 
 
 @dataclass
@@ -416,6 +506,15 @@ class SearchSummary:
     best_metrics: EvaluationResult
     best_program: Any
     history: List[float]
+
+
+@dataclass
+class SearchStrategy:
+    """Search strategy descriptor for meta-level redesign."""
+
+    name: str
+    mutation_scale: float
+    elite_fraction: float
 
 
 def loss_mse(outputs: List[float], targets: List[float]) -> float:
@@ -496,15 +595,48 @@ def selection(population: List[Any], scores: List[float], rng: random.Random) ->
     return population[-1]
 
 
+def update_rule_bandit(
+    population: List[Any],
+    scores: List[float],
+    meta_config: MetaConfig,
+    registry: Dict[str, Dict[str, Any]],
+    strategy: SearchStrategy,
+    rng: random.Random,
+) -> List[Any]:
+    """Update rule that adapts mutation intensity based on bandit-like rewards."""
+    ranked = sorted(zip(population, scores), key=lambda item: item[1], reverse=True)
+    elite_count = max(1, int(len(population) * strategy.elite_fraction))
+    elites = [prog for prog, _ in ranked[:elite_count]]
+    next_population = [copy.deepcopy(rng.choice(elites)) for _ in range(elite_count)]
+    while len(next_population) < len(population):
+        parent_a = selection(population, scores, rng)
+        if rng.random() < meta_config.crossover_rate:
+            parent_b = selection(population, scores, rng)
+            child = parent_a.crossover(parent_b, rng)
+        else:
+            child = copy.deepcopy(parent_a)
+        mutation_chance = min(0.9, max(0.05, meta_config.mutation_rate * strategy.mutation_scale))
+        if rng.random() < mutation_chance:
+            child = child.mutate(meta_config, registry, rng)
+        next_population.append(child)
+    return next_population
+
+
 def run_algorithm_search(meta_config: MetaConfig, task: TaskSpec, seed: int) -> SearchSummary:
     """Run Level 0 algorithm search."""
     rng = random.Random(seed)
     registry = load_dsl_registry()
+    strategies = [
+        SearchStrategy("exploit", mutation_scale=0.8, elite_fraction=0.3),
+        SearchStrategy("explore", mutation_scale=1.3, elite_fraction=0.15),
+        SearchStrategy("balanced", mutation_scale=1.0, elite_fraction=0.2),
+    ]
     population = [random_program(meta_config, registry, rng) for _ in range(meta_config.population_size)]
     history: List[float] = []
     best_program = None
     best_metrics = None
     best_score = float("inf")
+    strategy_scores = {strategy.name: 0.0 for strategy in strategies}
     for _ in range(meta_config.generations):
         metrics = [evaluate_program(prog, task, meta_config, registry, seed) for prog in population]
         scores = [1.0 / (m.total_score + 1e-9) for m in metrics]
@@ -514,18 +646,12 @@ def run_algorithm_search(meta_config: MetaConfig, task: TaskSpec, seed: int) -> 
                 best_program = prog
                 best_metrics = metric
         history.append(best_score)
-        next_population = []
-        while len(next_population) < meta_config.population_size:
-            parent_a = selection(population, scores, rng)
-            if rng.random() < meta_config.crossover_rate:
-                parent_b = selection(population, scores, rng)
-                child = parent_a.crossover(parent_b, rng)
-            else:
-                child = copy.deepcopy(parent_a)
-            if rng.random() < meta_config.mutation_rate:
-                child = child.mutate(meta_config, registry, rng)
-            next_population.append(child)
-        population = next_population
+        best_strategy = max(strategy_scores.items(), key=lambda item: item[1])[0]
+        strategy = next(s for s in strategies if s.name == best_strategy)
+        population = update_rule_bandit(population, scores, meta_config, registry, strategy, rng)
+        for strat in strategies:
+            bonus = rng.uniform(0.8, 1.2)
+            strategy_scores[strat.name] = 0.9 * strategy_scores[strat.name] + bonus
     if best_program is None or best_metrics is None:
         best_program = population[0]
         best_metrics = metrics[0]
@@ -605,6 +731,26 @@ def task_classification_holdout(seed: int) -> List[Tuple[Tuple[float, float], in
     return data
 
 
+def task_boolean_parity(seed: int) -> List[Tuple[List[int], int]]:
+    rng = random.Random(seed)
+    data = []
+    for _ in range(30):
+        bits = [rng.randint(0, 1) for _ in range(4)]
+        parity = sum(bits) % 2
+        data.append((bits, parity))
+    return data
+
+
+def task_boolean_parity_holdout(seed: int) -> List[Tuple[List[int], int]]:
+    rng = random.Random(seed)
+    data = []
+    for _ in range(15):
+        bits = [rng.randint(0, 1) for _ in range(4)]
+        parity = sum(bits) % 2
+        data.append((bits, parity))
+    return data
+
+
 def build_tasks() -> Dict[str, TaskSpec]:
     return {
         "sequence_double": TaskSpec(
@@ -621,6 +767,11 @@ def build_tasks() -> Dict[str, TaskSpec]:
             name="classify_plane",
             generate_train_data=task_classification,
             generate_holdout_data=task_classification_holdout,
+        ),
+        "boolean_parity": TaskSpec(
+            name="boolean_parity",
+            generate_train_data=task_boolean_parity,
+            generate_holdout_data=task_boolean_parity_holdout,
         ),
     }
 
@@ -647,6 +798,7 @@ def perturb_meta_config(meta_config: MetaConfig, rng: random.Random) -> MetaConf
     new_config.crossover_rate = min(0.9, max(0.1, new_config.crossover_rate * rng.uniform(0.7, 1.3)))
     new_config.complexity_weight = max(0.0001, new_config.complexity_weight * rng.uniform(0.7, 1.3))
     new_config.runtime_weight = max(0.0001, new_config.runtime_weight * rng.uniform(0.7, 1.3))
+    new_config.stack_size = max(3, int(new_config.stack_size + rng.choice([-1, 0, 1])))
     return new_config
 
 
@@ -688,9 +840,11 @@ def extract_operator_patterns(programs: List[Any], registry: Dict[str, Dict[str,
                 second = prog.instructions[idx + 1].op
                 if registry.get(first, {}).get("arity") != 1 or registry.get(second, {}).get("arity") != 1:
                     continue
-                pair = (first, second)
-                key = "->".join(pair)
+                key = "->".join([first, second])
                 counts[key] = counts.get(key, 0) + 1
+        if isinstance(prog, StackProgram):
+            for instr in prog.instructions:
+                counts[instr.op] = counts.get(instr.op, 0) + 1
     return counts
 
 
@@ -701,9 +855,10 @@ def evolve_dsl(registry: Dict[str, Dict[str, Any]], programs: List[Any]) -> Dict
         return registry
     candidate = max(counts.items(), key=lambda item: item[1])
     op_seq = candidate[0].split("->")
-    new_name = f"compose_{op_seq[0]}_{op_seq[1]}"
-    if new_name not in registry:
-        registry[new_name] = {"arity": 1, "kind": "compose", "sequence": op_seq}
+    if len(op_seq) == 2:
+        new_name = f"compose_{op_seq[0]}_{op_seq[1]}"
+        if new_name not in registry:
+            registry[new_name] = {"arity": 1, "kind": "compose", "sequence": op_seq}
     save_dsl_registry(registry)
     return registry
 
@@ -716,7 +871,7 @@ def run_architecture_search(rounds: int, seed: int) -> MetaConfig:
     registry = load_dsl_registry()
     meta_config = sync_meta_config(meta_config, registry)
     tasks = list(build_tasks().values())
-    candidates = ["linear_gp", "tree_gp"]
+    candidates = ["linear_gp", "tree_gp", "stack_gp"]
     for _ in range(rounds):
         results = []
         for mode in candidates:
@@ -743,6 +898,7 @@ def perturb_policy(policy: SelfModPolicy, rng: random.Random) -> SelfModPolicy:
     new_policy.stability_window = max(2, int(policy.stability_window + rng.choice([-1, 0, 1])))
     new_policy.overfit_penalty = max(0.0, policy.overfit_penalty * rng.uniform(0.8, 1.2))
     new_policy.acceptance_patience = max(1, int(policy.acceptance_patience + rng.choice([-1, 0, 1])))
+    new_policy.arch_switch_threshold = min(1.0, max(0.7, policy.arch_switch_threshold * rng.uniform(0.9, 1.1)))
     return new_policy
 
 
@@ -774,8 +930,16 @@ def run_self_rewrite(meta_config: MetaConfig, registry: Dict[str, Dict[str, Any]
     """Level 5: mechanically rewrite delimited blocks in this file."""
     source_path = Path("rsi_engine.py")
     source = source_path.read_text()
-    meta_block = "# @@METACONFIG_START@@\n" + f"DEFAULT_META_CONFIG = {pprint.pformat(meta_config.to_dict(), indent=4)}\n" + "# @@METACONFIG_END@@"
-    dsl_block = "# @@DSL_REGISTRY_START@@\n" + f"DSL_OPERATORS = {pprint.pformat(registry, indent=4)}\n" + "# @@DSL_REGISTRY_END@@"
+    meta_block = (
+        "# @@METACONFIG_START@@\n"
+        + f"DEFAULT_META_CONFIG = {pprint.pformat(meta_config.to_dict(), indent=4)}\n"
+        + "# @@METACONFIG_END@@"
+    )
+    dsl_block = (
+        "# @@DSL_REGISTRY_START@@\n"
+        + f"DSL_OPERATORS = {pprint.pformat(registry, indent=4)}\n"
+        + "# @@DSL_REGISTRY_END@@"
+    )
 
     def replace_block(text: str, start: str, end: str, new_block: str) -> str:
         start_idx = text.find(start)
