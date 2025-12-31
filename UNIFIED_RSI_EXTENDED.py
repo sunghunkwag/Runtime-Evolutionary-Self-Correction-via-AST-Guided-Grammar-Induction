@@ -208,33 +208,6 @@ def tail_blackboard(path: Path, k: int) -> List[Dict[str, Any]]:
     return records
 
 
-def load_generator_policy(path: Path) -> GeneratorPolicy:
-    if not path.exists():
-        return GeneratorPolicy(ast_bias={}, op_bias={}, templates=[], template_weights=[], version=1)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return GeneratorPolicy(ast_bias={}, op_bias={}, templates=[], template_weights=[], version=1)
-    return GeneratorPolicy(
-        ast_bias=data.get("ast_bias", {}),
-        op_bias=data.get("op_bias", {}),
-        templates=data.get("templates", []),
-        template_weights=data.get("template_weights", []),
-        version=data.get("version", 1),
-    )
-
-
-def save_generator_policy(path: Path, policy: GeneratorPolicy) -> None:
-    safe_mkdir(path.parent)
-    payload = {
-        "ast_bias": policy.ast_bias,
-        "op_bias": policy.op_bias,
-        "templates": policy.templates,
-        "template_weights": policy.template_weights,
-        "version": policy.version,
-    }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
 # ---------------------------
 # Invention Engine (RSI Integration)
 # ---------------------------
@@ -3578,69 +3551,6 @@ class AgentPolicy:
     slice_seconds: float
 
 
-@dataclass
-class GeneratorPolicy:
-    ast_bias: Dict[str, float]
-    op_bias: Dict[str, float]
-    templates: List[List[str]]
-    template_weights: List[float]
-    version: int = 1
-
-    def sample_template(self, rng: random.Random) -> Optional[List[str]]:
-        if not self.templates or not self.template_weights:
-            return None
-        total = sum(max(0.01, w) for w in self.template_weights)
-        roll = rng.random() * total
-        acc = 0.0
-        for tmpl, w in zip(self.templates, self.template_weights):
-            acc += max(0.01, w)
-            if roll <= acc:
-                return list(tmpl)
-        return list(rng.choice(self.templates))
-
-    def sample_op(self, rng: random.Random, default_ops: Dict[str, float]) -> str:
-        weights = {}
-        for op, w in default_ops.items():
-            bias = self.op_bias.get(op, 1.0)
-            weights[op] = max(0.01, w * bias)
-        total = sum(weights.values())
-        roll = rng.random() * total
-        acc = 0.0
-        for op, w in weights.items():
-            acc += w
-            if roll <= acc:
-                return op
-        return rng.choice(list(default_ops.keys()))
-
-    def update_from_genome(self, g: Genome, gate_ok: bool) -> "GeneratorPolicy":
-        try:
-            tree = ast.parse(g.code)
-        except Exception:
-            return self
-        counts = collections.Counter(type(node).__name__ for node in ast.walk(tree))
-        new_ast_bias = dict(self.ast_bias)
-        for node_name, count in counts.items():
-            prev = new_ast_bias.get(node_name, 1.0)
-            bump = 0.02 * min(count, 10)
-            new_ast_bias[node_name] = clamp(prev + bump, 0.2, 3.0)
-        new_op_bias = dict(self.op_bias)
-        if g.op_tag.startswith("mut:"):
-            op_name = g.op_tag.split("mut:", 1)[1].split("|")[0]
-            new_op_bias[op_name] = clamp(new_op_bias.get(op_name, 1.0) + (0.2 if gate_ok else -0.1), 0.1, 3.0)
-        new_templates = list(self.templates)
-        new_template_weights = list(self.template_weights)
-        if gate_ok and g.statements and g.statements not in new_templates:
-            new_templates.append(list(g.statements))
-            new_template_weights.append(1.0)
-        return GeneratorPolicy(
-            ast_bias=new_ast_bias,
-            op_bias=new_op_bias,
-            templates=new_templates,
-            template_weights=new_template_weights,
-            version=self.version,
-        )
-
-
 CREATOR_POLICY = AgentPolicy(
     generator_mode="synthesize",
     search_bias={
@@ -5311,7 +5221,6 @@ def _mutate_genome_with_meta(
     meta: MetaState,
     library: FunctionLibrary,
     op_bias: Optional[str] = None,
-    generator_policy: Optional[GeneratorPolicy] = None,
 ) -> Genome:
     stmts = g.statements[:]
     op_tag = "mutate"
@@ -5322,12 +5231,7 @@ def _mutate_genome_with_meta(
         stmts = apply_synthesized_op(rng, stmts, steps)
         op_tag = f"synth:{synth_name}"
     else:
-        if op_bias:
-            op = op_bias
-        elif generator_policy:
-            op = generator_policy.sample_op(rng, meta.op_weights)
-        else:
-            op = meta.sample_op(rng)
+        op = op_bias or meta.sample_op(rng)
         if op in OPERATORS:
             stmts = OPERATORS[op](rng, stmts)
         op_tag = f"mut:{op}"
@@ -5421,65 +5325,6 @@ def _adjust_creator_policy(
     )
 
 
-def _evaluate_multi_seed(
-    g: Genome,
-    seeds: List[int],
-    task: TaskSpec,
-    mode: str,
-    fixed_batch: Batch,
-    extra_env: Optional[Dict[str, Any]] = None,
-    validator: Callable[[str], Tuple[bool, str]] = validate_code,
-) -> Tuple[bool, EvalResult]:
-    results: List[EvalResult] = []
-    for s in seeds:
-        batch = get_task_batch(task, s, freeze_eval=True, gen=0)
-        if batch is None:
-            continue
-        res = _evaluate_candidate(
-            g,
-            _merge_stress(fixed_batch, batch),
-            mode,
-            task.name,
-            extra_env=extra_env,
-            validator=validator,
-        )
-        results.append(res)
-    if not results or not all(r.ok for r in results):
-        return False, EvalResult(False, float("inf"), float("inf"), float("inf"), float("inf"), 0, float("inf"), "multi_seed_fail")
-    avg = EvalResult(
-        True,
-        sum(r.train for r in results) / len(results),
-        sum(r.hold for r in results) / len(results),
-        sum(r.stress for r in results) / len(results),
-        sum(r.test for r in results) / len(results),
-        int(sum(r.nodes for r in results) / len(results)),
-        sum(r.score for r in results) / len(results),
-        None,
-    )
-    return True, avg
-
-
-def _adoption_ok(
-    candidate: EvalResult,
-    baseline: EvalResult,
-    min_improve: float = 0.01,
-    hold_margin: float = 0.02,
-    stress_margin: float = 0.02,
-) -> bool:
-    if not candidate.ok:
-        return False
-    if not baseline.ok or not math.isfinite(baseline.score):
-        return True
-    improvement = (baseline.score - candidate.score) / max(1e-9, baseline.score)
-    if improvement < min_improve:
-        return False
-    if candidate.hold > baseline.hold * (1.0 + hold_margin):
-        return False
-    if candidate.stress > baseline.stress * (1.0 + stress_margin):
-        return False
-    return True
-
-
 def _critic_rank_score(res: EvalResult, policy: AgentPolicy) -> float:
     simplicity = policy.search_bias.get("simplicity", 0.0)
     robustness = policy.search_bias.get("robustness", 0.0)
@@ -5554,13 +5399,10 @@ def run_duo_loop(
     creator_policy = CREATOR_POLICY
     critic_policy = CRITIC_POLICY
     reseed_templates: List[List[str]] = []
-    generator_policy_path = STATE_DIR / "generator_policy.json"
-    generator_policy = load_generator_policy(generator_policy_path)
     fixed_batch = get_task_batch(task, seed, freeze_eval=freeze_eval, gen=0)
     if fixed_batch is None:
         print("[DUO] No batch available; aborting.")
         return
-    eval_seeds = [seed, seed + 1, seed + 2]
 
     for r in range(rounds):
         round_seed = seed + r * 9973
@@ -5590,17 +5432,14 @@ def run_duo_loop(
                 break
             mode_choice = creator_policy.generator_mode
             if mode_choice == "template":
-                policy_template = generator_policy.sample_template(round_rng)
-                if policy_template:
-                    g = Genome(statements=policy_template, op_tag="policy_template")
-                elif reseed_templates:
+                if reseed_templates:
                     stmts = round_rng.choice(reseed_templates)
                     g = Genome(statements=list(stmts), op_tag="reseed")
                 else:
                     g = seed_genome(round_rng, hint)
             elif mode_choice == "mutate":
                 parent = round_rng.choice(universe.pool) if universe.pool else seed_genome(round_rng, hint)
-                g = _mutate_genome_with_meta(round_rng, parent, universe.meta, universe.library, generator_policy=generator_policy)
+                g = _mutate_genome_with_meta(round_rng, parent, universe.meta, universe.library)
             else:
                 g = _synthesize_genome(round_rng, universe.pool, hint, universe.library)
             creator_candidates.append(g)
@@ -5659,7 +5498,6 @@ def run_duo_loop(
             gate_pass += 1
             if pre_res:
                 prefiltered.append((g, pre_res))
-            generator_policy = generator_policy.update_from_genome(g, gate_ok=ok)
 
         if not prefiltered:
             scored_empty_count += 1
@@ -5693,7 +5531,6 @@ def run_duo_loop(
                 gate_fail_reasons=gate_fail_reasons,
                 validator_fail_reasons=validator_fail_reasons,
             )
-            save_generator_policy(generator_policy_path, generator_policy)
             continue
 
         prefiltered.sort(key=lambda t: _critic_rank_score(t[1], critic_policy))
@@ -5793,36 +5630,14 @@ def run_duo_loop(
         else:
             full_results.sort(key=lambda t: t[1].score)
             best_g, best_res = full_results[0]
-            candidate_ok, candidate_eval = _evaluate_multi_seed(
-                best_g,
-                eval_seeds,
-                task,
-                universe.eval_mode,
-                fixed_batch,
-                extra_env=helper_env,
-                validator=validate_program if universe.eval_mode == "program" else validate_code,
-            )
-            baseline_eval = EvalResult(False, float("inf"), float("inf"), float("inf"), float("inf"), 0, float("inf"), "no_baseline")
-            if universe.best:
-                baseline_ok, baseline_eval = _evaluate_multi_seed(
-                    universe.best,
-                    eval_seeds,
-                    task,
-                    universe.eval_mode,
-                    fixed_batch,
-                    extra_env=helper_env,
-                    validator=validate_program if universe.eval_mode == "program" else validate_code,
-                )
-                if not baseline_ok:
-                    baseline_eval = EvalResult(False, float("inf"), float("inf"), float("inf"), float("inf"), 0, float("inf"), "baseline_fail")
-            if candidate_ok and _adoption_ok(candidate_eval, baseline_eval):
+            if best_res.score < universe.best_score:
                 adopted = True
                 universe.best = best_g
-                universe.best_score = candidate_eval.score
-                universe.best_train = candidate_eval.train
-                universe.best_hold = candidate_eval.hold
-                universe.best_stress = candidate_eval.stress
-                universe.best_test = candidate_eval.test
+                universe.best_score = best_res.score
+                universe.best_train = best_res.train
+                universe.best_hold = best_res.hold
+                universe.best_stress = best_res.stress
+                universe.best_test = best_res.test
                 append_blackboard(
                     blackboard_path,
                     {
@@ -5832,9 +5647,9 @@ def run_duo_loop(
                         "candidate_hash": _candidate_hash(best_g.code),
                         "gate_ok": True,
                         "gate_reason": "",
-                        "score_train": candidate_eval.train,
-                        "score_holdout": candidate_eval.hold,
-                        "score_stress": candidate_eval.stress,
+                        "score_train": best_res.train,
+                        "score_holdout": best_res.hold,
+                        "score_stress": best_res.stress,
                         "selected": True,
                         "note": "adopted",
                     },
@@ -5856,7 +5671,6 @@ def run_duo_loop(
             validator_fail_reasons=validator_fail_reasons,
         )
 
-        save_generator_policy(generator_policy_path, generator_policy)
         gs = GlobalState(
             "RSI_EXTENDED_v2",
             now_ms(),
