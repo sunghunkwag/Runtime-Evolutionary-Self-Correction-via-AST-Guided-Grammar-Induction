@@ -33,10 +33,12 @@ import difflib
 import hashlib
 import json
 import math
+import copy
 import os
 import random
 import re
 import subprocess
+import shutil
 import sys
 import tempfile
 import textwrap
@@ -179,7 +181,7 @@ class InventionProgramCandidate:
     code: str
     origin: str
     parent_id: Optional[str] = None
-    score: float = 0.0
+    score: float = 0.011744
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     features: Dict[str, int] = field(default_factory=dict)
 
@@ -543,7 +545,7 @@ class ProblemGenerator:
 class RewardModel:
     performance_weight: float = 1.0
     transfer_weight: float = 0.7
-    reuse_weight: float = 0.4
+    reuse_weight: float = 0.480815
     compression_weight: float = 0.3
 
     def score(self, metrics: Dict[str, float]) -> float:
@@ -2410,7 +2412,7 @@ class EvalResult:
     err: Optional[str] = None
 
 
-SCORE_W_HOLD = 0.57
+SCORE_W_HOLD = 0.452390
 SCORE_W_STRESS = 0.4
 SCORE_W_TRAIN = 0.0
 
@@ -2588,10 +2590,15 @@ def evaluate_algo(
     ok2, ho_err, ho_steps, ho_timeout, _, e2 = algo_exec(code, b.x_ho, b.y_ho, task_name, counterexamples)
     ok3, st_err, st_steps, st_timeout, _, e3 = algo_exec(code, b.x_st, b.y_st, task_name, counterexamples)
     ok4, te_err, te_steps, te_timeout, _, e4 = algo_exec(code, b.x_te, b.y_te, task_name, counterexamples)
-    ok = ok1 and ok2 and ok3 and ok4
+    ok = ok1 and ok2 and ok3 and ok4 and all(math.isfinite(v) for v in (tr_err, ho_err, st_err, te_err))
     nodes = node_count(code)
     step_penalty = 0.0001 * (tr_steps + ho_steps + st_steps + te_steps)
     timeout_penalty = 0.5 * (tr_timeout + ho_timeout + st_timeout + te_timeout)
+    if not ok:
+        return EvalResult(False, tr_err, ho_err, st_err, te_err, nodes, float("inf"), e1 or e2 or e3 or e4 or "nan")
+    # Hard cutoff: stress overflows are rejected before any score aggregation.
+    if st_err > STRESS_MAX:
+        return EvalResult(False, tr_err, ho_err, st_err, te_err, nodes, float("inf"), "stress_overflow")
     score = SCORE_W_HOLD * ho_err + SCORE_W_STRESS * st_err + SCORE_W_TRAIN * tr_err + lam * nodes + step_penalty + timeout_penalty
     err = e1 or e2 or e3 or e4
     return EvalResult(ok, tr_err, ho_err, st_err, te_err, nodes, score, err or None)
@@ -2612,6 +2619,11 @@ def evaluate(
     ok4, te, e4 = mse_exec(code, b.x_te, b.y_te, task_name, extra_env=extra_env)
     ok = ok1 and ok2 and ok3 and ok4 and all(math.isfinite(v) for v in (tr, ho, st, te))
     nodes = node_count(code)
+    if not ok:
+        return EvalResult(False, tr, ho, st, te, nodes, float("inf"), e1 or e2 or e3 or e4 or "nan")
+    # Hard cutoff: stress overflows are rejected before any score aggregation.
+    if st > STRESS_MAX:
+        return EvalResult(False, tr, ho, st, te, nodes, float("inf"), "stress_overflow")
     score = SCORE_W_HOLD * ho + SCORE_W_STRESS * st + SCORE_W_TRAIN * tr + lam * nodes
     err = e1 or e2 or e3 or e4
     return EvalResult(ok, tr, ho, st, te, nodes, score, err or None)
@@ -2669,6 +2681,12 @@ def evaluate_learner(
         stress = run_eval(b.x_st, b.y_st, do_update=False)
         test = run_eval(b.x_te, b.y_te, do_update=False)
         nodes = node_count(learner.code)
+        ok = all(math.isfinite(v) for v in (train, hold, stress, test))
+        if not ok:
+            return EvalResult(False, train, hold, stress, test, nodes, float("inf"), "nan")
+        # Hard cutoff: stress overflows are rejected before any score aggregation.
+        if stress > STRESS_MAX:
+            return EvalResult(False, train, hold, stress, test, nodes, float("inf"), "stress_overflow")
         obj = objective(train, hold, stress, nodes)
         if not isinstance(obj, (int, float)) or not math.isfinite(obj):
             obj = SCORE_W_HOLD * hold + SCORE_W_STRESS * stress
@@ -3535,6 +3553,27 @@ class Universe:
         scored: List[Tuple[Genome, EvalResult]] = []
         all_results: List[Tuple[Genome, EvalResult]] = []
         for g in self.pool:
+            # Hard gate: enforce input dependence before any scoring/selection.
+            gate_ok, gate_reason = _hard_gate_ok(
+                g.code,
+                batch,
+                self.eval_mode if self.eval_mode != "program" else "solver",
+                task.name,
+                extra_env=helper_env,
+            )
+            if not gate_ok:
+                res = EvalResult(
+                    False,
+                    float("inf"),
+                    float("inf"),
+                    float("inf"),
+                    float("inf"),
+                    node_count(g.code),
+                    float("inf"),
+                    f"hard_gate:{gate_reason}",
+                )
+                all_results.append((g, res))
+                continue
             if self.eval_mode == "algo":
                 res = evaluate_algo(g, batch, task.name, self.meta.complexity_lambda)
             else:
@@ -3744,6 +3783,21 @@ class UniverseLearner:
         scored: List[Tuple[LearnerGenome, EvalResult]] = []
         all_results: List[Tuple[LearnerGenome, EvalResult]] = []
         for g in self.pool:
+            # Hard gate: enforce input dependence before any scoring/selection.
+            gate_ok, gate_reason = _hard_gate_ok(g.code, batch, "learner", task.name)
+            if not gate_ok:
+                res = EvalResult(
+                    False,
+                    float("inf"),
+                    float("inf"),
+                    float("inf"),
+                    float("inf"),
+                    node_count(g.code),
+                    float("inf"),
+                    f"hard_gate:{gate_reason}",
+                )
+                all_results.append((g, res))
+                continue
             res = evaluate_learner(g, batch, task.name, self.meta.adapt_steps, self.meta.complexity_lambda)
             all_results.append((g, res))
             if res.ok:
@@ -4415,6 +4469,7 @@ def transfer_bench(
 # ---------------------------
 
 STRESS_MAX = 1_000_000.0
+OUTPUT_VARIANCE_EPS = 1e-6
 RSI_CONFIRM_ROUNDS = 2
 
 def _outputs_constant(outputs: List[Any], tol: float = 1e-9) -> bool:
@@ -4425,18 +4480,32 @@ def _outputs_constant(outputs: List[Any], tol: float = 1e-9) -> bool:
         return all(isinstance(o, (int, float)) and abs(o - first) <= tol for o in outputs[1:])
     return all(_algo_equal(o, first) for o in outputs[1:])
 
-def _piecewise_constant(outputs: List[Any], max_unique: int = 2) -> bool:
-    if not outputs:
-        return True
+def _unique_output_count(outputs: List[Any]) -> int:
     uniques: List[Any] = []
     for out in outputs:
         if not any(_algo_equal(out, seen) for seen in uniques):
             uniques.append(out)
-        if len(uniques) > max_unique:
-            return False
-    return True
+    return len(uniques)
 
-def _collect_outputs(code: str, xs: List[Any], mode: str, extra_env: Optional[Dict[str, Any]] = None) -> Tuple[bool, List[Any], str]:
+def _piecewise_constant(outputs: List[Any], max_unique: int = 2) -> bool:
+    if not outputs:
+        return True
+    return _unique_output_count(outputs) <= max_unique
+
+def _variance_low(outputs: List[Any], eps: float = OUTPUT_VARIANCE_EPS) -> bool:
+    if not outputs or not all(isinstance(o, (int, float)) for o in outputs):
+        return False
+    vals = [float(o) for o in outputs]
+    mean = sum(vals) / len(vals)
+    var = sum((v - mean) ** 2 for v in vals) / max(1, len(vals))
+    return var <= eps
+
+def _collect_outputs(
+    code: str,
+    xs: List[Any],
+    mode: str,
+    extra_env: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, List[Any], str]:
     outputs: List[Any] = []
     if mode == "learner":
         env = safe_load_module(code)
@@ -4470,25 +4539,59 @@ def _collect_outputs(code: str, xs: List[Any], mode: str, extra_env: Optional[Di
         outputs.append(out)
     return True, outputs, ""
 
-def _hard_gate_ok(code: str, batch: Batch, mode: str, task_name: str) -> Tuple[bool, str]:
+def _hard_gate_ok(
+    code: str,
+    batch: Batch,
+    mode: str,
+    task_name: str,
+    extra_env: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str]:
     xs = batch.x_ho[:8] if batch.x_ho else batch.x_tr[:8]
     if not xs:
         return False, "no_inputs"
-    ok, outputs, err = _collect_outputs(code, xs, mode)
+    ok, outputs, err = _collect_outputs(code, xs, mode, extra_env=extra_env)
     if not ok:
         return False, err
+    # Hard gate: reject any non-finite numeric output (timeouts/NaNs are disqualifying).
+    for out in outputs:
+        if isinstance(out, (int, float)) and not math.isfinite(out):
+            return False, "non_finite_output"
+    # Hard gate: reject constant or near-constant outputs to enforce input dependence.
     if _outputs_constant(outputs):
         return False, "constant_output"
+    # Hard gate: prevent piecewise-constant or low-diversity output hacks.
     if _piecewise_constant(outputs):
         return False, "piecewise_constant"
+    # Hard gate: reject numerically low-variance responses (e.g., tiny jitter around a constant).
+    if _variance_low(outputs):
+        return False, "low_variance_output"
     return True, ""
 
-def _evaluate_candidate(g: Union[Genome, LearnerGenome], batch: Batch, mode: str, task_name: str) -> EvalResult:
+def _evaluate_candidate(
+    g: Union[Genome, LearnerGenome],
+    batch: Batch,
+    mode: str,
+    task_name: str,
+    extra_env: Optional[Dict[str, Any]] = None,
+    validator: Callable[[str], Tuple[bool, str]] = validate_code,
+) -> EvalResult:
+    gate_ok, gate_reason = _hard_gate_ok(g.code, batch, mode, task_name, extra_env=extra_env)
+    if not gate_ok:
+        return EvalResult(
+            False,
+            float("inf"),
+            float("inf"),
+            float("inf"),
+            float("inf"),
+            node_count(g.code),
+            float("inf"),
+            f"hard_gate:{gate_reason}",
+        )
     if mode == "learner":
         return evaluate_learner(g, batch, task_name)
     if mode == "algo":
         return evaluate_algo(g, batch, task_name)
-    return evaluate(g, batch, task_name)
+    return evaluate(g, batch, task_name, extra_env=extra_env, validator=validator)
 
 def _merge_stress(fixed: Batch, resampled: Batch) -> Batch:
     return Batch(
@@ -4514,46 +4617,442 @@ def _save_rsi_archive(path: Path, archive: Dict[str, Any]) -> None:
     safe_mkdir(path.parent)
     path.write_text(json.dumps(archive, indent=2), encoding="utf-8")
 
+def _load_state_snapshot(state_dir: Path) -> Optional[Dict[str, Any]]:
+    state_path = state_dir / "state.json"
+    if not state_path.exists():
+        return None
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _write_state_snapshot(state_dir: Path, snapshot: Dict[str, Any]) -> None:
+    safe_mkdir(state_dir)
+    (state_dir / "state.json").write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+
+def _current_best_score(snapshot: Optional[Dict[str, Any]]) -> float:
+    if not snapshot:
+        return float("inf")
+    universes = snapshot.get("universes", [])
+    selected_uid = snapshot.get("selected_uid", None)
+    best = float("inf")
+    for u in universes:
+        score = float(u.get("best_score", float("inf")))
+        if selected_uid is not None and u.get("uid") == selected_uid:
+            return score
+        best = min(best, score)
+    return best
+
+def _clone_state_dir(src: Path, dest: Path) -> None:
+    safe_mkdir(dest)
+    if not src.exists():
+        return
+    for item in src.iterdir():
+        target = dest / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, target)
+
+def _autopatch_evolve_score(
+    script: Path,
+    state_dir: Path,
+    mode: str,
+    task_name: str,
+    seed: int,
+    generations: int,
+    population: int,
+    universes: int,
+    resume: bool,
+    freeze_eval: bool = True,
+) -> float:
+    if mode == "learner":
+        cmd = [
+            sys.executable,
+            str(script),
+            "learner-evolve",
+            "--seed",
+            str(seed),
+            "--generations",
+            str(generations),
+            "--population",
+            str(population),
+            "--universes",
+            str(universes),
+            "--task",
+            task_name,
+            "--state-dir",
+            str(state_dir),
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            str(script),
+            "evolve",
+            "--seed",
+            str(seed),
+            "--generations",
+            str(generations),
+            "--population",
+            str(population),
+            "--universes",
+            str(universes),
+            "--task",
+            task_name,
+            "--state-dir",
+            str(state_dir),
+        ]
+        if mode:
+            cmd.extend(["--mode", mode])
+    if resume:
+        cmd.append("--resume")
+    if not freeze_eval:
+        cmd.append("--no-freeze-eval")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if result.returncode != 0:
+        return float("inf")
+    return _current_best_score(_load_state_snapshot(state_dir))
+
+def _autopatch_probe_score(
+    mode: str,
+    task_name: str,
+    seed: int = 1337,
+    generations: int = 6,
+    population: int = 32,
+    universes: int = 1,
+    freeze_eval: bool = True,
+) -> float:
+    task = TaskSpec(name=task_name)
+    gs = run_multiverse(
+        seed,
+        task,
+        generations,
+        population,
+        universes,
+        resume=False,
+        save_every=0,
+        mode=mode,
+        freeze_eval=freeze_eval,
+    )
+    if not gs.universes:
+        return float("inf")
+    best_snapshot = next((u for u in gs.universes if u.get("uid") == gs.selected_uid), gs.universes[0])
+    return float(best_snapshot.get("best_score", float("inf")))
+
+def _probe_score(script: Path, mode: str, task_name: str) -> float:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "autopatch-probe",
+                "--mode",
+                mode,
+                "--task",
+                task_name,
+                "--state-dir",
+                tmpdir,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    if result.returncode != 0:
+        return float("inf")
+    output = result.stdout.strip().splitlines()
+    if not output:
+        return float("inf")
+    try:
+        return float(output[-1].strip())
+    except Exception:
+        return float("inf")
+
+def _replace_source_segment(source: str, old: str, new: str) -> str:
+    if old not in source:
+        return source
+    return source.replace(old, new, 1)
+
+def _mutate_hyperparameter(
+    tree: ast.AST,
+    source: str,
+    param_name: str,
+    rng: random.Random,
+) -> Tuple[str, str, Optional[float]]:
+    ranges: Dict[str, Tuple[float, float]] = {
+        "mutation_rate": (0.05, 0.95),
+        "crossover_rate": (0.0, 0.9),
+        "complexity_lambda": (1e-5, 1e-2),
+        "epsilon_explore": (0.05, 0.5),
+    }
+    int_ranges: Dict[str, Tuple[int, int]] = {
+        "adapt_steps": (4, 16),
+    }
+    target_node: Optional[ast.AnnAssign] = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "MetaState":
+            for stmt in node.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    if stmt.target.id == param_name:
+                        target_node = stmt
+                        break
+    if not target_node:
+        return source, "", None
+    old_segment = ast.get_source_segment(source, target_node.value) or ""
+    if param_name in int_ranges:
+        low, high = int_ranges[param_name]
+        new_value = rng.randint(low, high)
+        new_segment = str(new_value)
+    else:
+        low, high = ranges.get(param_name, (0.0, 1.0))
+        new_value = rng.uniform(low, high)
+        new_segment = f"{new_value:.6f}"
+    new_source = _replace_source_segment(source, old_segment, new_segment)
+    return new_source, f"L1:{param_name}", float(new_value)
+
+def _mutate_operator(tree: ast.AST, source: str, rng: random.Random) -> Tuple[str, str]:
+    target_assign: Optional[ast.Assign] = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "act":
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign):
+                    if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                        if stmt.targets[0].id == "op_weights" and isinstance(stmt.value, ast.Dict):
+                            target_assign = stmt
+                            break
+    if not target_assign or not isinstance(target_assign.value, ast.Dict):
+        return source, ""
+    new_source = source
+    for key_node, value_node in zip(target_assign.value.keys, target_assign.value.values):
+        if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+            continue
+        key = key_node.value
+        if key not in ("insert_assign", "list_manip"):
+            continue
+        old_segment = ast.get_source_segment(source, value_node) or ""
+        offset = rng.uniform(0.0, 0.5)
+        if key == "list_manip":
+            offset = rng.uniform(0.0, 0.3)
+        if "op_scale" not in old_segment:
+            continue
+        if "op_scale +" in old_segment:
+            new_segment = re.sub(r"op_scale\s*\+\s*[-+]?\d*\.?\d+", f"op_scale + {offset:.3f}", old_segment)
+        else:
+            new_segment = re.sub(r"op_scale\s*-\s*[-+]?\d*\.?\d+", f"op_scale - {offset:.3f}", old_segment)
+        if new_segment == old_segment:
+            continue
+        new_source = _replace_source_segment(new_source, old_segment, new_segment)
+    return new_source, "L2:op_weights"
+
+def _mutate_evaluation(tree: ast.AST, source: str, rng: random.Random) -> Tuple[str, str]:
+    weights = {
+        "SCORE_W_HOLD": rng.uniform(0.45, 0.7),
+        "SCORE_W_STRESS": rng.uniform(0.2, 0.6),
+        "SCORE_W_TRAIN": rng.uniform(0.0, 0.2),
+    }
+    new_source = source
+    changed = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name in weights:
+                old_segment = ast.get_source_segment(source, node.value) or ""
+                new_segment = f"{weights[name]:.6f}"
+                if old_segment:
+                    new_source = _replace_source_segment(new_source, old_segment, new_segment)
+                    changed = True
+    return new_source, "L3:score_weights" if changed else ""
+
+def _evaluate_patch_candidate(
+    patch_code: str,
+    baseline_score: float,
+    mode: str,
+    task_name: str,
+) -> Tuple[bool, float, float]:
+    """Evaluate a patch candidate. Returns (accepted, improvement, new_score)."""
+    min_improvement_threshold = 0.03
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+        f.write(patch_code)
+        tmp = Path(f.name)
+    try:
+        new_score = _probe_score(tmp, mode, task_name)
+    finally:
+        tmp.unlink(missing_ok=True)
+    if not math.isfinite(baseline_score) or baseline_score <= 0:
+        return False, 0.0, new_score
+    improvement = (baseline_score - new_score) / baseline_score
+    return improvement >= min_improvement_threshold, improvement, new_score
+
+def _select_best_patch(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    valid = [c for c in candidates if c.get("improvement", 0.0) > 0.0]
+    if not valid:
+        return None
+    return max(valid, key=lambda c: (c["improvement"], -c["diff_size"]))
+
+def _safe_apply_patch(self_path: Path, new_code: str) -> bool:
+    backup_path = self_path.with_suffix(".py.bak")
+    shutil.copy(self_path, backup_path)
+    try:
+        ast.parse(new_code)
+        self_path.write_text(new_code, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(self_path), "selftest"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Selftest failed")
+        return True
+    except Exception:
+        shutil.copy(backup_path, self_path)
+        return False
+
+def _log_autopatch_attempt(record: Dict[str, Any]) -> None:
+    log_path = STATE_DIR / "autopatch_log.jsonl"
+    safe_mkdir(log_path.parent)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+def run_deep_autopatch(
+    levels: List[int],
+    candidates: int = 4,
+    apply: bool = True,
+    mode: str = "solver",
+) -> Dict[str, Any]:
+    """
+    True RSI self-modification system with fitness-gated acceptance and rollback safety.
+    Core change: evolve after mutation instead of re-evaluating the same code.
+    """
     script = Path(__file__).resolve()
-    baseline = probe_run(script, mode, task_name)
+    source = script.read_text(encoding="utf-8")
+    state_snapshot = _load_state_snapshot(STATE_DIR)
+    task_name = (state_snapshot or {}).get("task", {}).get("name", TaskSpec().name)
+    seed = int((state_snapshot or {}).get("base_seed", 1337))
+    universes = max(1, len((state_snapshot or {}).get("universes", [])) or 1)
+    pool_len = 0
+    if state_snapshot and state_snapshot.get("universes"):
+        pool_len = len(state_snapshot["universes"][0].get("pool", []))
+    population = max(64, pool_len, 32)
+    baseline = _current_best_score(state_snapshot)
+    if not math.isfinite(baseline) or baseline <= 0:
+        baseline = _probe_score(script, mode, task_name)
     print(f"[AUTOPATCH L{levels}] Baseline: {baseline:.4f}")
 
-    plans = propose_patches(gs, levels)[:candidates]
-    if not plans:
-        return {"error": "No patches generated"}
+    rng = random.Random(int(time.time()) % 100000)
+    patch_candidates: List[Dict[str, Any]] = []
 
-    results = []
-    best_plan, best_score = (None, baseline)
+    for level in levels:
+        for _ in range(candidates):
+            tree = ast.parse(source)
+            patch_type = ""
+            mutated_source = source
+            mutated_state = copy.deepcopy(state_snapshot) if state_snapshot else None
+            mutated_params: Dict[str, Any] = {}
+            if level == 1:
+                param = rng.choice(["mutation_rate", "crossover_rate", "complexity_lambda", "epsilon_explore", "adapt_steps"])
+                mutated_source, patch_type, new_value = _mutate_hyperparameter(tree, source, param, rng)
+                if new_value is None:
+                    continue
+                if param == "adapt_steps":
+                    new_value = int(round(new_value))
+                mutated_params[param] = new_value
+                if mutated_state:
+                    for u in mutated_state.get("universes", []):
+                        meta = u.get("meta", {})
+                        meta[param] = new_value
+                        u["meta"] = meta
+            elif level == 2:
+                mutated_source, patch_type = _mutate_operator(tree, source, rng)
+            elif level == 3:
+                mutated_source, patch_type = _mutate_evaluation(tree, source, rng)
+            if not patch_type or (mutated_source == source and not mutated_params):
+                continue
+            diff = unified_diff(source, mutated_source, str(script))
+            diff_size = len(diff.splitlines())
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_state_dir = Path(tmpdir)
+                if state_snapshot:
+                    _clone_state_dir(STATE_DIR, tmp_state_dir)
+                    if mutated_state:
+                        _write_state_snapshot(tmp_state_dir, mutated_state)
+                script_path = script
+                if mutated_source != source:
+                    script_path = tmp_state_dir / script.name
+                    script_path.write_text(mutated_source, encoding="utf-8")
+                new_score = _autopatch_evolve_score(
+                    script_path,
+                    tmp_state_dir,
+                    mode,
+                    task_name,
+                    seed,
+                    generations=10,
+                    population=population,
+                    universes=universes,
+                    resume=state_snapshot is not None,
+                    freeze_eval=True,
+                )
+            improvement = baseline - new_score
+            accepted = improvement > 0
+            record = {
+                "level": level,
+                "patch_type": patch_type,
+                "old_score": baseline,
+                "new_score": new_score,
+                "improvement": improvement,
+                "diff_size": diff_size,
+                "accepted": accepted,
+                "params": mutated_params,
+            }
+            _log_autopatch_attempt(record)
+            if accepted:
+                print(f"[AUTOPATCH] {patch_type} -> {new_score:.4f} (ACCEPT +{improvement:.2f})")
+            else:
+                print(f"[AUTOPATCH] {patch_type} -> {new_score:.4f} (REJECT)")
+            patch_candidates.append(
+                {
+                    **record,
+                    "diff": diff,
+                    "code": mutated_source,
+                    "state": mutated_state,
+                }
+            )
 
-    for p in plans:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
-            f.write(p.new_source)
-            tmp = Path(f.name)
-        try:
-            score = probe_run(tmp, mode, task_name)
-            improved = score < baseline - 1e-6
-            results.append({"level": p.level, "id": p.patch_id, "title": p.title, "score": score, "improved": improved})
-            print(f"[L{p.level}] {p.patch_id}: {p.title} -> {score:.4f} {'OK' if improved else 'FAIL'}")
-            if improved and score < best_score:
-                best_score, best_plan = score, p
-        finally:
-            tmp.unlink(missing_ok=True)
+    best = _select_best_patch(patch_candidates)
+    if not best:
+        return {
+            "applied": False,
+            "improvement": 0.0,
+            "old_score": baseline,
+            "new_score": baseline,
+            "patch_type": "",
+            "diff": "",
+    }
 
-    if best_plan and apply:
-        backup = script.with_suffix(".bak")
-        if not backup.exists():
-            backup.write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
-        script.write_text(best_plan.new_source, encoding="utf-8")
-        print(f"[OK] Applied L{best_plan.level} patch: {best_plan.title}")
-        return {"applied": best_plan.patch_id, "level": best_plan.level, "score": best_score, "results": results}
+    if apply:
+        applied = True
+        if best["code"] != source:
+            applied = _safe_apply_patch(script, best["code"])
+        if applied and best.get("state"):
+            _write_state_snapshot(STATE_DIR, best["state"])
+        if applied:
+            print(f"[RSI] Self-modified! Score: {best['old_score']:.4f} -> {best['new_score']:.4f}")
+        return {
+            "applied": applied,
+            "improvement": best["improvement"],
+            "old_score": best["old_score"],
+            "new_score": best["new_score"],
+            "patch_type": best["patch_type"],
+            "diff": best["diff"],
+        }
 
-    if best_plan:
-        out = STATE_DIR / "patched.py"
-        out.write_text(best_plan.new_source, encoding="utf-8")
-        print(f"[OK] Best patch saved to {out}")
-        return {"best": best_plan.patch_id, "score": best_score, "file": str(out), "results": results}
-
-    return {"improved": False, "baseline": baseline, "results": results}
+    return {
+        "applied": False,
+        "improvement": best["improvement"],
+        "old_score": best["old_score"],
+        "new_score": best["new_score"],
+        "patch_type": best["patch_type"],
+        "diff": best["diff"],
+    }
 
 
 def load_recent_scores(log_path: Path, n: int) -> List[float]:
@@ -4620,7 +5119,24 @@ def run_rsi_loop(
     for r in range(rounds):
         print(f"\n{'='*60}\n[RSI ROUND {r+1}/{rounds}]\n{'='*60}")
         print(f"[EVOLVE] {gens_per_round} generations...")
-        run_multiverse(seed, task, gens_per_round, pop, n_univ, resume=(r > 0), mode=mode, freeze_eval=freeze_eval)
+        gs = run_multiverse(seed, task, gens_per_round, pop, n_univ, resume=(r > 0), mode=mode, freeze_eval=freeze_eval)
+        best_snapshot = next((u for u in gs.universes if u.get("uid") == gs.selected_uid), None)
+        best_data = (best_snapshot or {}).get("best")
+        best_code = None
+        if isinstance(best_data, dict):
+            if mode == "learner":
+                best_code = LearnerGenome(**best_data).code
+            else:
+                best_code = Genome(**best_data).code
+        if best_code and best_code != "none":
+            gate_ok, gate_reason = _hard_gate_ok(best_code, fixed_batch, mode, task.name)
+            if not gate_ok:
+                print(f"[RSI] Hard gate failed for best candidate ({gate_reason}); rejecting before scoring/autopatch.")
+                archive["current"] = None
+                archive["consecutive"] = 0
+                archive["entries"] = []
+                _save_rsi_archive(archive_path, archive)
+                continue
         recent_scores = load_recent_scores(STATE_DIR / "run_log.jsonl", 5)
         forced_applied = False
         if is_300s_stagnation(recent_scores):
@@ -4677,6 +5193,21 @@ def cmd_selftest(args):
     assert validate_algo_program(algo_code)[0]
 
     print("[selftest] OK")
+    return 0
+
+def cmd_autopatch_probe(args):
+    global STATE_DIR
+    STATE_DIR = Path(args.state_dir)
+    score = _autopatch_probe_score(
+        mode=args.mode,
+        task_name=args.task,
+        seed=args.seed,
+        generations=args.generations,
+        population=args.population,
+        universes=args.universes,
+        freeze_eval=args.freeze_eval,
+    )
+    print(f"{score:.6f}")
     return 0
 
 def cmd_evolve(args):
@@ -4845,9 +5376,21 @@ def build_parser():
     r.add_argument("--universes", type=int, default=2)
     r.add_argument("--state-dir", default=".rsi_state")
     r.add_argument("--mode", default="solver", choices=["solver", "learner", "algo"])
+    r.add_argument("--levels", default="1,2,3", help="Comma-separated autopatch levels (e.g., 1,3)")
     r.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
     r.add_argument("--meta-meta", action="store_true", help="Run meta-meta loop instead of standard RSI rounds")
     r.set_defaults(fn=cmd_rsi_loop)
+
+    ap = sub.add_parser("autopatch-probe")
+    ap.add_argument("--mode", default="solver", choices=["solver", "learner", "algo"])
+    ap.add_argument("--task", default="poly2")
+    ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--generations", type=int, default=6)
+    ap.add_argument("--population", type=int, default=32)
+    ap.add_argument("--universes", type=int, default=1)
+    ap.add_argument("--state-dir", default=".rsi_state")
+    ap.add_argument("--freeze-eval", action=argparse.BooleanOptionalAction, default=True)
+    ap.set_defaults(fn=cmd_autopatch_probe)
 
     mm = sub.add_parser("meta-meta")
     mm.add_argument("--seed", type=int, default=1337)
